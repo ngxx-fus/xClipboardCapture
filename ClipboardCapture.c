@@ -27,7 +27,9 @@ xcb_connection_t *Connection            = NULL;
 volatile sig_atomic_t TogglePopUpStatus = eNOT_STARTED;
 volatile sig_atomic_t RequestExit       = eDEACTIVATE;
 volatile sig_atomic_t ReqTestInject     = eDEACTIVATE;
-static pthread_t SignalRuntimeThread;
+
+static pthread_t SignalRuntimeThread;    /// Thread 1: OS Signal Handling
+static pthread_t XClipboardRuntimeThread; /// Thread 2: X11 Clipboard Logic
 
 /**************************************************************************************************
  * X11 SEVER SECTION ******************************************************************************
@@ -450,51 +452,56 @@ RetType XClipboardRuntime(int Param) {
  * LIFECYCLE SECTION IMPLEMENTATION ***************************************************************
  **************************************************************************************************/ 
 
-/// @brief Cleans up resources and waits for the background threads to exit safely.
+/// @brief Cleans up resources and waits for all background threads to exit safely.
 void ClipboardCaptureFinalize(void) {
-    xLog1("[Finalize] Waiting for Signal Thread to cleanly exit...");
-    
-    /// Send a signal to wake up the thread from pause()
-    int KillStatus = pthread_kill(SignalRuntimeThread, SIGINT); 
-    
-    if (KillStatus == ESRCH) {
-        xLog1("[Finalize] Signal Thread has already exited on its own. No need to wake it.");
-    } else if (KillStatus != 0) {
-        xWarn2("[Finalize] pthread_kill returned unexpected status: %d", KillStatus);
+    xLog1("[Finalize] Initiating shutdown sequence...");
+
+    /// 1. Wake up and join the Signal Thread
+    int SigKillStatus = pthread_kill(SignalRuntimeThread, SIGINT);
+    if (SigKillStatus == 0) {
+        pthread_join(SignalRuntimeThread, NULL);
+        xLog1("[Finalize] Signal Thread joined.");
     }
 
-    /// Wait for the thread to fully exit and clean up resources (reap the zombie thread)
-    pthread_join(SignalRuntimeThread, NULL);
+    /// 2. Join the XClipboard Thread
+    /// Note: XClipboardRuntime will exit its while-loop because RequestExit is now eACTIVATE
+    pthread_join(XClipboardRuntimeThread, NULL);
+    xLog1("[Finalize] XClipboard Thread joined.");
 
     xLog1("[Finalize] Application exited gracefully.");
     xExit1("ClipboardCaptureFinalize");
 }
 
+/**
+ * @brief Initializes the system and launches worker threads.
+ * @return OKE on success, ERR on failure.
+ */
 RetType ClipboardCaptureInitialize(void) {
     xEntry1("ClipboardCaptureInitialize");
     
-    /* 1. Register the Finalize function to run automatically when the program exits */
+    /* 1. Register the Finalize function for automatic cleanup */
     atexit(ClipboardCaptureFinalize);
 
-    /* 2. Prepare Directories (Tạo thư mục DBs, ClipboardItem...) */
+    /* 2. Prepare Directories */
     if (EnsureDB() != OKE) {
-        xError("[Initialize] System Check Failed! Exiting...");
+        xError("[Initialize] System Check Failed!");
         return ERR; 
     }
 
-    /* 3. Create the Signal Thread (SignalRuntimeThread is now static global) */
-    int ThreadStatus = pthread_create(&SignalRuntimeThread, NULL, (void *(*)(void *))SignalRuntime, NULL);
-    if (ThreadStatus != 0) {
-        xError("[Initialize] Failed to create Signal Thread! Error code: %d", ThreadStatus);
+    /* 3. Create Thread 1: Signal Runtime */
+    if (pthread_create(&SignalRuntimeThread, NULL, (void *(*)(void *))SignalRuntime, NULL) != 0) {
+        xError("[Initialize] Failed to create Signal Thread!");
         return ERR;
     }
-    xLog1("[Initialize] Signal Thread started successfully. Running in background...");
 
-    /* 4. Start the blocking X11 Core Runtime */
-    xLog1("[Initialize] Starting X11 Core Runtime...");
-    XClipboardRuntime(0);
+    /* 4. Create Thread 2: XClipboard Runtime */
+    /* This thread will now run XClipboardRuntime in the background */
+    if (pthread_create(&XClipboardRuntimeThread, NULL, (void *(*)(void *))XClipboardRuntime, NULL) != 0) {
+        xError("[Initialize] Failed to create XClipboard Thread!");
+        return ERR;
+    }
 
-    /* 5. Return success when the blocking runtime finishes (e.g., via Ctrl+C) */
+    xLog1("[Initialize] All systems started. Main thread is now free.");
     xExit1("ClipboardCaptureInitialize");
     return OKE;
 }

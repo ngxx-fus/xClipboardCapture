@@ -5,6 +5,50 @@
 #include "CBC_Setup.h"
 
 /**************************************************************************************************
+ * CLIPBOARD ITEM DEFINITION SECTION *************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Union to hold clipboard item metadata with raw access capability.
+typedef union {
+    uint8_t RawData[NAME_MAX + 1 + sizeof(time_t)];
+    struct {
+        char Filename[NAME_MAX + 1]; 
+        time_t Timestamp;            
+    };
+} sClipboardItem;
+
+/**************************************************************************************************
+ * PUBLIC FUNCTION PROTOTYPES *********************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Scans the DB directory to count and populate the list. 
+int XCBList_Scan(void);
+
+/// @brief Synchronizes the list from disk and sorts it (Newest first).
+RetType XCBList_ScanAndSort(void);
+
+/// @brief Adds a new file to the list. Triggers rescan if file is missing.
+RetType XCBList_PushItem(char FileName[]);
+
+/// @brief Removes the newest item from list and disk.
+RetType XCBList_PopItem(sClipboardItem *Output);
+
+/// @brief Gets the latest item without removing it.
+RetType XCBList_GetLatestItem(sClipboardItem *Output);
+
+/// @brief Removes item at index 'n' from list and disk.
+RetType XCBList_RemoveItem(int n, sClipboardItem *Output);
+
+/// @brief Gets item metadata at index 'n'.
+RetType XCBList_GetItem(int n, sClipboardItem *Output);
+
+/// @brief Returns current size of the list.
+int XCBList_GetItemSize(void);
+
+/// @brief Reads file content into a binary buffer.
+RetType XCBList_ReadAsBinary(int n, void* Output, int MaxOutputSize);
+
+/**************************************************************************************************
  * SYSTEMCALL HELPER SECTION PROTOTYPES ***********************************************************
  **************************************************************************************************/ 
 

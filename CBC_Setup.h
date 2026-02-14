@@ -43,6 +43,8 @@
 /// @brief Unique string ID for X11 internal property exchange.
 #define PROP_NAME           "NGXX_FUS_CLIPBOARD_PROP"
 
+#define MAX_HISTORY_ITEMS   1000 
+
 
 /**************************************************************************************************
  * CONFIG/DECLARE SECTION *************************************************************************
