@@ -40,8 +40,15 @@ void SubscribeClipboardEvents(xcb_connection_t *c, xcb_window_t window);
  * @param buffer Output buffer for the filename.
  * @param size Size of the buffer.
  */
-void GetTimeBasedFilename(char *buffer, size_t size);
+void GetTimeBasedFilenameTxt(char *buffer, size_t size);
 
+/**
+ * @brief Helper to generate a filename based on current time with optional extension.
+ * @param buffer Output buffer for the filename.
+ * @param size Size of the buffer.
+ * @param ext Extension string (e.g., "png", "txt"). If NULL, no extension is added.
+ */
+void GetTimeBasedFilename(char *buffer, size_t size, const char *ext);
 
 /**************************************************************************************************
  * CLIPBOARD PROVIDER SECTION PROTOTYPES **********************************************************

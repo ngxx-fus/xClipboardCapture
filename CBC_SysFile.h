@@ -8,12 +8,15 @@
  * CLIPBOARD ITEM DEFINITION SECTION *************************************************************
  **************************************************************************************************/ 
 
+enum XCBFileType {eFMT_NONE, eFMT_TXT, eFMT_IMG_JGP, eFMT_IMG_PNG};
+
 /// @brief Union to hold clipboard item metadata with raw access capability.
 typedef union {
-    uint8_t RawData[NAME_MAX + 1 + sizeof(time_t)];
+    uint8_t RawData[NAME_MAX + 1 + sizeof(time_t) + sizeof(enum XCBFileType)];
     struct {
-        char Filename[NAME_MAX + 1]; 
-        time_t Timestamp;            
+        char                Filename[NAME_MAX + 1]; 
+        time_t              Timestamp;
+        enum XCBFileType    FileType;
     };
 } sClipboardItem;
 
@@ -21,32 +24,32 @@ typedef union {
  * PUBLIC FUNCTION PROTOTYPES *********************************************************************
  **************************************************************************************************/ 
 
-/// @brief Scans the DB directory to count and populate the list. 
-int XCBList_Scan(void);
+/// @brief Extracts "C.txt" from "A/B/C.txt". Returns ERR if ends with '/'.
+RetType GetFileNameFromPath(char *Path, char *OutputFileName, int MaxFileNameSize);
 
-/// @brief Synchronizes the list from disk and sorts it (Newest first).
-RetType XCBList_ScanAndSort(void);
+/// @brief Scans DB directory. Keeps only MAX_HISTORY_ITEMS, deletes the rest.
+int XCBList_Scan(int WithNoLock);
 
-/// @brief Adds a new file to the list. Triggers rescan if file is missing.
-RetType XCBList_PushItem(char FileName[]);
+/// @brief Pushes a name/path to list (No disk check). Extracts filename only.
+RetType XCBList_PushItem(char Path[]);
 
-/// @brief Removes the newest item from list and disk.
+/// @brief Pushes a name/path only if it actually exists in PATH_DIR_DB.
+RetType XCBList_PushItemWithExistCheck(char Path[]);
+
+/// @brief Removes oldest item from RAM and deletes its physical file.
 RetType XCBList_PopItem(sClipboardItem *Output);
 
-/// @brief Gets the latest item without removing it.
-RetType XCBList_GetLatestItem(sClipboardItem *Output);
-
-/// @brief Removes item at index 'n' from list and disk.
-RetType XCBList_RemoveItem(int n, sClipboardItem *Output);
-
-/// @brief Gets item metadata at index 'n'.
+/// @brief Gets item at index 'n' (0 = newest). Pass NULL to Output to only verify existence.
 RetType XCBList_GetItem(int n, sClipboardItem *Output);
 
-/// @brief Returns current size of the list.
-int XCBList_GetItemSize(void);
+/// @brief Gets the most recent item. Pass NULL to Output to only verify existence.
+RetType XCBList_GetLatestItem(sClipboardItem *Output);
 
-/// @brief Reads file content into a binary buffer.
+/// @brief Reads file binary content. Pass NULL to Output to verify disk presence.
 RetType XCBList_ReadAsBinary(int n, void* Output, int MaxOutputSize);
+
+/// @brief Returns the total items currently in RAM list.
+int XCBList_GetItemSize(void);
 
 /**************************************************************************************************
  * SYSTEMCALL HELPER SECTION PROTOTYPES ***********************************************************

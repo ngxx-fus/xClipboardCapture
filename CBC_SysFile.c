@@ -1,195 +1,260 @@
 #include "CBC_SysFile.h"
-
+#include "CBC_Setup.h"
+#include <xUniversal.h>
+#include <xUniversalReturn.h>
 
 /**************************************************************************************************
  * INTERNAL DATA SECTION **************************************************************************
  **************************************************************************************************/ 
 
-/// @brief Global list of clipboard history, sorted from Newest to Oldest.
-static sClipboardItem XCBList[MAX_HISTORY_ITEMS];
-static int            XCBListSize = 0;
+static sClipboardItem   XCBList[MAX_HISTORY_ITEMS];
+static int              XCBListSize = 0;
+static int              HeadIndex   = -1;
+static pthread_mutex_t  ListMutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**************************************************************************************************
- * INTERNAL HELPERS *******************************************************************************
+ * LOCKING HELPERS *******************************************************************************
  **************************************************************************************************/ 
 
-/// @brief Compare function for qsort (Descending order: Newest first)
-static int CompareItems(const void *a, const void *b) {
+static void LockList(void)   { pthread_mutex_lock(&ListMutex);   }
+static void UnlockList(void) { pthread_mutex_unlock(&ListMutex); }
+
+/**************************************************************************************************
+ * INTERNAL HELPERS: INDEX CONVERSION & FILE TYPE *************************************************
+ **************************************************************************************************/ 
+
+/// @brief Converts a logical UI index (0 = Newest) to the physical array index.
+static int Convert2AllocatedIndex(int LinearIndex) {
+    if (LinearIndex < 0 || LinearIndex >= XCBListSize) return -1;
+    return (HeadIndex - LinearIndex + MAX_HISTORY_ITEMS) % MAX_HISTORY_ITEMS;
+}
+
+/// @brief Converts a physical array index to the logical UI index.
+static int Convert2LinearIndex(int AllocatedIndex) {
+    if (XCBListSize == 0) return -1;
+    return (HeadIndex - AllocatedIndex + MAX_HISTORY_ITEMS) % MAX_HISTORY_ITEMS;
+}
+
+/// @brief Parses file extension to determine FileType enum.
+static enum XCBFileType GetFileTypeFromName(const char* Filename) {
+    char *ext = strrchr(Filename, '.');
+    if (!ext) return eFMT_NONE;
+    if (strcasecmp(ext, ".txt") == 0) return eFMT_TXT;
+    if (strcasecmp(ext, ".png") == 0) return eFMT_IMG_PNG;
+    if (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0) return eFMT_IMG_JGP;
+    return eFMT_NONE;
+}
+
+/// @brief Sort comparator (Ascending): Oldest first. Used ONLY during initial Scan to setup buffer.
+static int CompareItemsAsc(const void *a, const void *b) {
     sClipboardItem *itemA = (sClipboardItem *)a;
     sClipboardItem *itemB = (sClipboardItem *)b;
-    if (itemA->Timestamp < itemB->Timestamp) return 1;
-    if (itemA->Timestamp > itemB->Timestamp) return -1;
+    if (itemA->Timestamp > itemB->Timestamp) return 1;
+    if (itemA->Timestamp < itemB->Timestamp) return -1;
     return 0;
 }
 
+/// @brief Internal PopOldest for Circle Buffer. Physically removes from disk.
+static RetType Internal_PopOldest(sClipboardItem *Output) {
+    if (XCBListSize <= 0) return ERR;
+    
+    /// The oldest item is always at the last linear index
+    int OldestAllocIdx = Convert2AllocatedIndex(XCBListSize - 1);
+    if (OldestAllocIdx < 0) return ERR;
+    
+    char FullPath[PATH_MAX];
+    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, XCBList[OldestAllocIdx].Filename);
+
+    if (Output != NULL) {
+        memcpy(Output, &XCBList[OldestAllocIdx], sizeof(sClipboardItem));
+    }
+
+    /// Delete using RemoveDir for safety (handles files and folders)
+    RemoveDir(FullPath);
+
+    XCBListSize--;
+    return OKE;
+}
+
 /**************************************************************************************************
- * PUBLIC FUNCTIONS IMPLEMENTATION ***************************************************************
+ * SYSTEM / UTILS IMPLEMENTATION ******************************************************************
  **************************************************************************************************/ 
 
-int XCBList_Scan(void) {
-    xEntry1("XCBList_Scan");
+RetType GetFileNameFromPath(char *Path, char *OutputFileName, int MaxFileNameSize) {
+    if (!Path || !OutputFileName) return ERR;
+    char *LastSlash = strrchr(Path, '/');
+    char *CleanName = (LastSlash) ? (LastSlash + 1) : Path;
+    if (*CleanName == '\0') return ERR;
+
+    strncpy(OutputFileName, CleanName, MaxFileNameSize - 1);
+    OutputFileName[MaxFileNameSize - 1] = '\0';
+    return OKE;
+}
+
+/**************************************************************************************************
+ * PUBLIC LIST IMPLEMENTATION *********************************************************************
+ **************************************************************************************************/ 
+
+int XCBList_Scan(int WithNoLock) {
+    if (!WithNoLock) LockList();
+
     DIR *DirStream = opendir(PATH_DIR_DB);
     struct dirent *Entry;
     struct stat FileStat;
     char FullPath[PATH_MAX];
     
     XCBListSize = 0;
+    HeadIndex = -1; /// Reset Circle Buffer
 
     if (DirStream == NULL) {
-        xError("[Scan] Cannot open directory: %s", PATH_DIR_DB);
+        if (!WithNoLock) UnlockList();
         return ERR;
     }
 
     while ((Entry = readdir(DirStream)) != NULL) {
         if (Entry->d_name[0] == '.') continue;
-
-        if (XCBListSize >= MAX_HISTORY_ITEMS) {
-            xWarn2("[Scan] List full! Ignoring extra files in DB.");
-            break;
-        }
-
+        
         snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, Entry->d_name);
-        if (stat(FullPath, &FileStat) == 0) {
-            strncpy(XCBList[XCBListSize].Filename, Entry->d_name, NAME_MAX);
-            XCBList[XCBListSize].Filename[NAME_MAX] = '\0';
-            XCBList[XCBListSize].Timestamp = FileStat.st_mtime;
-            XCBListSize++;
+        
+        if (XCBListSize < MAX_HISTORY_ITEMS) {
+            if (stat(FullPath, &FileStat) == 0) {
+                strncpy(XCBList[XCBListSize].Filename, Entry->d_name, NAME_MAX);
+                XCBList[XCBListSize].Filename[NAME_MAX] = '\0';
+                XCBList[XCBListSize].Timestamp = FileStat.st_mtime;
+                XCBList[XCBListSize].FileType = GetFileTypeFromName(Entry->d_name);
+                XCBListSize++;
+            }
+        } else {
+            RemoveDir(FullPath); /// Excess items purged safely
         }
     }
     closedir(DirStream);
-    
-    xExit1("XCBList_Scan");
+
+    /// Setup valid chronological Circle Buffer order
+    if (XCBListSize > 0) {
+        qsort(XCBList, XCBListSize, sizeof(sClipboardItem), CompareItemsAsc);
+        HeadIndex = XCBListSize - 1; 
+    }
+
+    if (!WithNoLock) UnlockList();
     return XCBListSize;
 }
 
-RetType XCBList_ScanAndSort(void) {
-    xEntry1("XCBList_ScanAndSort");
+RetType XCBList_PushItem(char Path[]) {
+    char CleanName[256];
 
-    if (XCBList_Scan() < 0) return ERR;
+    xEntry1("XCBList_PushItem(%s)", Path);
 
-    if (XCBListSize > 0) {
-        qsort(XCBList, XCBListSize, sizeof(sClipboardItem), CompareItems);
+    if (GetFileNameFromPath(Path, CleanName, sizeof(CleanName)) != OKE) return ERR;
+
+    LockList();
+    if (XCBListSize >= MAX_HISTORY_ITEMS) {
+        Internal_PopOldest(NULL); 
     }
 
-    xLog1("[ScanAndSort] Sorted %d items.", XCBListSize);
-    xExit1("XCBList_ScanAndSort");
+    /// Advance Head Index and wrap around
+    HeadIndex = (HeadIndex + 1) % MAX_HISTORY_ITEMS;
+
+    strncpy(XCBList[HeadIndex].Filename, CleanName, NAME_MAX);
+    XCBList[HeadIndex].Filename[NAME_MAX] = '\0';
+    XCBList[HeadIndex].Timestamp = time(NULL);
+    XCBList[HeadIndex].FileType = GetFileTypeFromName(CleanName);
+
+    XCBListSize++;
+    UnlockList();
     return OKE;
 }
 
-RetType XCBList_PushItem(char FileName[]) {
-    xEntry1("XCBList_PushItem");
+RetType XCBList_PushItemWithExistCheck(char Path[]) {
+    char CleanName[256];
+    if (GetFileNameFromPath(Path, CleanName, sizeof(CleanName)) != OKE) return ERR;
+
     struct stat FileStat;
     char FullPath[PATH_MAX];
+    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, CleanName);
 
-    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, FileName);
-    if (stat(FullPath, &FileStat) != 0) {
-        xWarn2("[PushItem] %s missing. Rescanning...", FileName);
-        XCBList_ScanAndSort();
-        return ERR;
-    }
+    if (stat(FullPath, &FileStat) != 0) return ERR;
 
-    int TargetIdx = (XCBListSize < MAX_HISTORY_ITEMS) ? XCBListSize++ : MAX_HISTORY_ITEMS - 1;
-    strncpy(XCBList[TargetIdx].Filename, FileName, NAME_MAX);
-    XCBList[TargetIdx].Timestamp = FileStat.st_mtime;
+    XCBList_PushItem(CleanName);
 
-    qsort(XCBList, XCBListSize, sizeof(sClipboardItem), CompareItems);
-    xExit1("XCBList_PushItem");
+    LockList();
+    XCBList[HeadIndex].Timestamp = FileStat.st_mtime;
+    UnlockList();
     return OKE;
 }
 
 RetType XCBList_PopItem(sClipboardItem *Output) {
-    if (XCBListSize <= 0) return ERR;
+    LockList();
+    RetType Ret = Internal_PopOldest(Output);
+    UnlockList();
+    return Ret;
+}
 
-    char FullPath[PATH_MAX];
-    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, XCBList[0].Filename);
-
-    if (Output) memcpy(Output, &XCBList[0], sizeof(sClipboardItem));
-
-    if (remove(FullPath) != 0) {
-        xWarn2("[PopItem] Disk sync error. Rescanning...");
-        XCBList_ScanAndSort();
+RetType XCBList_GetItem(int n, sClipboardItem *Output) {
+    LockList();
+    int AllocIdx = Convert2AllocatedIndex(n);
+    if (AllocIdx < 0) {
+        UnlockList();
         return ERR;
     }
-
-    memmove(&XCBList[0], &XCBList[1], (XCBListSize - 1) * sizeof(sClipboardItem));
-    XCBListSize--;
+    
+    if (Output != NULL) {
+        memcpy(Output, &XCBList[AllocIdx], sizeof(sClipboardItem));
+    }
+    UnlockList();
     return OKE;
 }
 
 RetType XCBList_GetLatestItem(sClipboardItem *Output) {
-    if (XCBListSize <= 0 || Output == NULL) return ERR;
-    memcpy(Output, &XCBList[0], sizeof(sClipboardItem));
-    return OKE;
-}
-
-RetType XCBList_RemoveItem(int n, sClipboardItem *Output) {
-    if (n < 0 || n >= XCBListSize) return ERR;
-
-    char FullPath[PATH_MAX];
-    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, XCBList[n].Filename);
-
-    if (Output) memcpy(Output, &XCBList[n], sizeof(sClipboardItem));
-
-    if (remove(FullPath) != 0) {
-        XCBList_ScanAndSort();
-        return ERR;
-    }
-
-    if (n < XCBListSize - 1) {
-        memmove(&XCBList[n], &XCBList[n + 1], (XCBListSize - n - 1) * sizeof(sClipboardItem));
-    }
-    XCBListSize--;
-    return OKE;
-}
-
-RetType XCBList_GetItem(int n, sClipboardItem *Output) {
-    if (n < 0 || n >= XCBListSize || Output == NULL) return ERR;
-    memcpy(Output, &XCBList[n], sizeof(sClipboardItem));
-    return OKE;
+    return XCBList_GetItem(0, Output);
 }
 
 int XCBList_GetItemSize(void) {
-    return XCBListSize;
+    int Size;
+    LockList();
+    Size = XCBListSize;
+    UnlockList();
+    return Size;
 }
 
-/// @brief Reads file content into a binary buffer with size protection.
 RetType XCBList_ReadAsBinary(int n, void* Output, int MaxOutputSize) {
-    if (n < 0 || n >= XCBListSize || Output == NULL || MaxOutputSize <= 0) return ERR;
-
+    xEntry1("XCBList_ReadAsBinary(%d, %p, %d)", n, Output, MaxOutputSize);
+    LockList();
+    int AllocIdx = Convert2AllocatedIndex(n);
+    if (AllocIdx < 0) { 
+        UnlockList(); 
+        return ERR_OVERFLOW; 
+    }
+    
     char FullPath[PATH_MAX];
-    /// Fix: Access via .Filename due to union structure
-    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, XCBList[n].Filename);
+    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, XCBList[AllocIdx].Filename);
+    UnlockList();
+
+    xLog1("[XCBList_ReadAsBinary] FullPath=%s", FullPath);
 
     FILE *f = fopen(FullPath, "rb");
-    if (!f) {
-        xWarn2("[ReadAsBinary] File lost: %s. Rescanning...", XCBList[n].Filename);
-        XCBList_ScanAndSort();
-        return ERR;
+    if (!f) return ERR;
+    
+    if (Output == NULL) { 
+        fclose(f); 
+        return OKE; 
     }
 
-    /// 1. Get actual file size
     fseek(f, 0, SEEK_END);
     long FileSize = ftell(f);
     rewind(f);
 
-    /// 2. Safety check: Prevent buffer overflow
-    if (FileSize > (long)MaxOutputSize) {
-        xError("[ReadAsBinary] Buffer too small! File: %ld, Max: %d", FileSize, MaxOutputSize);
+    if (FileSize > (long)MaxOutputSize) { 
         fclose(f); 
-        return ERR; /// Cút ngay lập tức, không cho đọc!
+        return ERR; 
     }
-
-    /// 3. Read data - Chỉ chạy khi Size hợp lệ
+    
     size_t ReadSize = fread(Output, 1, FileSize, f);
     fclose(f);
 
-    /// 4. Verify integrity
-    if (ReadSize != (size_t)FileSize) {
-        xError("[ReadAsBinary] Read mismatch for %s", XCBList[n].Filename);
-        return ERR;
-    }
-
-    return OKE;
+    xLog1("[XCBList_ReadAsBinary] ReadSize=%d", ReadSize);
+    
+    return (ReadSize == (size_t)FileSize) ? OKE : ERR;
 }
 
 /**************************************************************************************************

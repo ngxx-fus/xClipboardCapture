@@ -1,5 +1,6 @@
 #include "ClipboardCapture.h"
 #include "CBC_Setup.h"
+#include "CBC_SysFile.h"
 #include <xUniversal.h>
 
 
@@ -14,6 +15,7 @@ xcb_atom_t AtomTarget;
 xcb_atom_t AtomPng;
 xcb_atom_t AtomJpeg;
 xcb_atom_t AtomProperty;
+xcb_atom_t AtomTimestamp;
 
 /// @brief Global variables to hold the data we want to "paste" to other apps.
 void *ActiveData = NULL;
@@ -30,6 +32,18 @@ volatile sig_atomic_t ReqTestInject     = eDEACTIVATE;
 
 static pthread_t SignalRuntimeThread;    /// Thread 1: OS Signal Handling
 static pthread_t XClipboardRuntimeThread; /// Thread 2: X11 Clipboard Logic
+
+#define INCR_CHUNK_SIZE 65536
+
+xcb_atom_t AtomIncr;
+
+/// INCR State Machine Variables
+uint8_t      *IncrData = NULL;
+size_t       IncrDataLen = 0;
+size_t       IncrOffset = 0;
+xcb_window_t IncrRequestor = XCB_NONE;
+xcb_atom_t   IncrProperty = XCB_NONE;
+xcb_atom_t   IncrTarget = XCB_NONE;
 
 /**************************************************************************************************
  * X11 SEVER SECTION ******************************************************************************
@@ -66,6 +80,8 @@ void InitAtoms(xcb_connection_t *c) {
     AtomPng       = GetAtomByName(c, "image/png");
     AtomJpeg      = GetAtomByName(c, "image/jpeg");
     AtomProperty  = GetAtomByName(c, PROP_NAME);
+    AtomTimestamp = GetAtomByName(c, "TIMESTAMP"); 
+    AtomIncr      = GetAtomByName(c, "INCR");
     xExit1("InitAtoms");
 }
 
@@ -118,13 +134,40 @@ void SubscribeClipboardEvents(xcb_connection_t *c, xcb_window_t window) {
  * @param buffer Output buffer for the filename.
  * @param size Size of the buffer.
  */
-void GetTimeBasedFilename(char *buffer, size_t size) {
+void GetTimeBasedFilenameTxt(char *buffer, size_t size) {
     time_t rawtime;
     struct tm *timeinfo;
     time(&rawtime);
     timeinfo = localtime(&rawtime);
     /* Format: YYYYMMDD_HHMMSS.txt */
     strftime(buffer, size, "%Y%m%d_%H%M%S.txt", timeinfo);
+}
+
+/**
+ * @brief Helper to generate a filename based on current time with optional extension.
+ * @param buffer Output buffer for the filename.
+ * @param size Size of the buffer.
+ * @param ext Extension string (e.g., "png", "txt"). If NULL, no extension is added.
+ */
+void GetTimeBasedFilename(char *buffer, size_t size, const char *ext) {
+    time_t rawtime;
+    struct tm *timeinfo;
+    char TimeStr[64];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    /* 1. Generate the base timestamp: YYYYMMDD_HHMMSS */
+    strftime(TimeStr, sizeof(TimeStr), "%Y%m%d_%H%M%S", timeinfo);
+
+    /* 2. Handle extension logic */
+    if (ext == NULL || ext[0] == '\0') {
+        /// If ext is NULL, just copy the timestamp
+        snprintf(buffer, size, "%s", TimeStr);
+    } else {
+        /// If ext exists, append it with a dot
+        snprintf(buffer, size, "%s.%s", TimeStr, ext);
+    }
 }
 
 
@@ -169,8 +212,6 @@ void SetClipboardData(xcb_connection_t *c, xcb_window_t win, void *data, size_t 
     xExit1("SetClipboardData");
 }
 
-
-
 /**************************************************************************************************
  * SIGNAL HANDLER SECTION *************************************************************************
  **************************************************************************************************/ 
@@ -193,8 +234,7 @@ void SignalEventHandler(int SigNum) {
     } 
     else if (SigNum == SIGUSR1) {
         /* Custom signal received from another terminal (pkill -SIGUSR1 TestProg) */
-        const char *TestStr = "Hello from Phu's Clipboard! Khai code thành công :>";
-        xLog1("[SignalEventHandler] Injecting string (`%s`) into X11 Clipboard...", TestStr);
+        xLog1("[SignalEventHandler] Injecting * into X11 Clipboard...");
             
         /* Gọi hàm SetClipboardData mình đã viết ở phần trước */
         /// SetClipboardData(Connection, MyWindow, (void *)TestStr, strlen(TestStr), AtomUtf8);
@@ -278,11 +318,6 @@ RetType SignalRuntime(int Param) {
 }
 
 /**************************************************************************************************
- * CLIPBOARD RUNTIME SECTION **********************************************************************
- **************************************************************************************************/ 
-
-
-/**************************************************************************************************
  * CLIPBOARD EVENT HANDLERS IMPLEMENTATION ********************************************************
  **************************************************************************************************/
 
@@ -344,57 +379,157 @@ void HandleSelectionNotify(xcb_generic_event_t *Event) {
         }
         /* Case 2: Saving received data (UTF8/PNG/JPG) */
         else if (Nevent->target == AtomUtf8 || Nevent->target == AtomPng || Nevent->target == AtomJpeg) {
-            char Filename[128], FullPath[1024];
-            GetTimeBasedFilename(Filename, sizeof(Filename));
+            char Filename[NAME_MAX], FullPath[PATH_MAX];
+            const char *Extension = "txt"; /// Default extension
 
-            if (Nevent->target == AtomPng) strcpy(strrchr(Filename, '.'), ".png");
-            else if (Nevent->target == AtomJpeg) strcpy(strrchr(Filename, '.'), ".jpg");
+            /* Step 1: Determine the correct extension */
+            if (Nevent->target == AtomPng) Extension = "png";
+            else if (Nevent->target == AtomJpeg) Extension = "jpg";
+            else if (Nevent->target == AtomUtf8) Extension = "txt";
 
+            /* Step 2: Generate filename with the determined extension */
+            GetTimeBasedFilename(Filename, sizeof(Filename), Extension);
+
+            /*Push the FINAL filename to RAM list (No Check - Fast) */
+            XCBList_PushItem(Filename);
+
+            /* Step 3: Save to disk first to ensure data integrity */
             snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, Filename);
-            FILE *fp = fopen(FullPath, "w");
+            FILE *fp = fopen(FullPath, "wb"); /// Use "wb" for binary data like images
             if (fp) {
                 fwrite(Data, 1, ByteLen, fp);
                 fclose(fp);
+                
                 xLog1("[XClipboardRuntime] Saved %d bytes to %s", ByteLen, Filename);
+            } else {
+                xError("[XClipboardRuntime] Failed to open file for writing: %s", FullPath);
             }
         }
     }
     if (reply) free(reply);
 }
 
-/**
- * @brief Handles Selection Request events (Providing data to other apps).
- */
-void HandleSelectionRequest(xcb_generic_event_t *Event) {
-    xcb_selection_request_event_t *Req = (xcb_selection_request_event_t *)Event;
-    xLog1("[XClipboardRuntime] [Event] Received SelectionRequest from window: %u", Req->requestor);
 
-    xcb_selection_notify_event_t Reply = {0};
-    memset(&Reply, 0, sizeof(Reply));
-    Reply.response_type = XCB_SELECTION_NOTIFY;
-    Reply.requestor = Req->requestor;
-    Reply.selection = Req->selection;
-    Reply.target = Req->target;
-    Reply.time = Req->time;
-    Reply.property = XCB_NONE;
+#define INCR_CHUNK_SIZE 65536 /// 64KB Chunk for INCR protocol transfer
 
-    if (Req->target == AtomTarget) {
-        xcb_atom_t SupportedTargets[] = { AtomTarget, ActiveDataType };
-        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, Req->property, XCB_ATOM_ATOM, 32, 2, SupportedTargets);
-        Reply.property = Req->property;
+/// @brief Handles Property Notify events, specifically used for pumping data during INCR protocol.
+void HandlePropertyNotify(xcb_generic_event_t *Event) {
+    xcb_property_notify_event_t *PropEv = (xcb_property_notify_event_t *)Event;
+    
+    /// Check if the target application has deleted the property (meaning they consumed the previous chunk)
+    if (PropEv->state == XCB_PROPERTY_DELETE && 
+        PropEv->window == IncrRequestor && 
+        PropEv->atom == IncrProperty) {
+        
+        size_t BytesLeft = IncrDataLen - IncrOffset;
+        
+        if (BytesLeft > 0) {
+            /// Pump the next chunk (Maximum 64KB per chunk)
+            size_t ChunkSize = (BytesLeft > INCR_CHUNK_SIZE) ? INCR_CHUNK_SIZE : BytesLeft;
+            
+            /// Note: IncrData must be cast to (uint8_t *) to safely perform pointer arithmetic
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, 
+                                IncrProperty, IncrTarget, 8, ChunkSize, 
+                                (uint8_t *)IncrData + IncrOffset);
+            
+            IncrOffset += ChunkSize;
+            /// xLog1("[INCR] Sent chunk... Left: %zu bytes", IncrDataLen - IncrOffset);
+        } else {
+            /// Transfer is finished! Send a 0-byte payload to signal completion (EOF).
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, 
+                                IncrProperty, IncrTarget, 8, 0, NULL);
+            xLog1("[INCR] Transfer Complete!");
+            
+            /// Reset the State Machine
+            IncrRequestor = XCB_NONE;
+            IncrProperty = XCB_NONE;
+            IncrTarget = XCB_NONE;
+        }
     }
-    else if (Req->target == ActiveDataType && ActiveData != NULL) {
-        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, Req->property, ActiveDataType, 8, ActiveDataLen, ActiveData);
-        Reply.property = Req->property;
-    }
-
-    xcb_send_event(Connection, 0, Req->requestor, XCB_EVENT_MASK_NO_EVENT, (const char *)&Reply);
     xcb_flush(Connection);
 }
 
-/**
- * @brief The main loop that manages X11 connections and dispatches events.
- */
+/// @brief Handles Selection Request events, providing clipboard data to other applications.
+void HandleSelectionRequest(xcb_generic_event_t *Event) {
+    xEntry1("HandleSelectionRequest");
+    xcb_selection_request_event_t *Req = (xcb_selection_request_event_t *)Event;
+    
+    xLog1("[XClipboardRuntime] [Event] SelectionRequest from window: %u for target: %u", 
+          Req->requestor, Req->target);
+
+    xcb_selection_notify_event_t Reply;
+    memset(&Reply, 0, sizeof(Reply));
+    Reply.response_type = XCB_SELECTION_NOTIFY;
+    Reply.requestor     = Req->requestor;
+    Reply.selection     = Req->selection;
+    Reply.target        = Req->target;
+    Reply.time          = Req->time;
+    
+    /// 1. ICCCM Rule: Safely handle obsolete clients that send NONE as the property
+    xcb_atom_t ValidProperty = (Req->property == XCB_NONE) ? Req->target : Req->property;
+    Reply.property = XCB_NONE; /// Default to failure (NONE) until a request succeeds
+
+    /// 2. TARGETS Negotiation: Tell the requestor what formats we support
+    if (Req->target == AtomTarget) { 
+        /// MUST include TARGETS and TIMESTAMP for strict ICCCM standard compliance
+        xcb_atom_t SupportedTargets[] = { AtomTarget, AtomTimestamp, ActiveDataType };
+        int NumTargets = sizeof(SupportedTargets) / sizeof(xcb_atom_t);
+        
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                            ValidProperty, XCB_ATOM_ATOM, 32, NumTargets, SupportedTargets);
+        Reply.property = ValidProperty;
+    }
+    
+    /// 3. TIMESTAMP Handling: Satisfy modern toolkits (GTK/Qt) to prevent race conditions
+    else if (Req->target == AtomTimestamp) {
+        xcb_timestamp_t CurrentTime = Req->time; /// Mirror the requested time back
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                            ValidProperty, XCB_ATOM_INTEGER, 32, 1, &CurrentTime);
+        Reply.property = ValidProperty;
+    }
+
+    /// 4. Actual Data Transmission (Text / Image)
+    else if (Req->target == ActiveDataType && ActiveData != NULL) {
+        
+        /// A. INCR Protocol (For Large Files like Images)
+        if (ActiveDataLen > INCR_CHUNK_SIZE) {
+            xLog1("[XRuntime] Data > 64KB. Starting INCR Protocol...");
+
+            /// Initialize the INCR State Machine
+            IncrData = ActiveData;
+            IncrDataLen = ActiveDataLen;
+            IncrOffset = 0;
+            IncrRequestor = Req->requestor;
+            IncrProperty = ValidProperty;
+            IncrTarget = ActiveDataType;
+
+            /// Subscribe to Property Change events on the requestor's window
+            uint32_t event_mask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
+            xcb_change_window_attributes(Connection, Req->requestor, XCB_CW_EVENT_MASK, event_mask);
+
+            /// Send the initial INCR signal containing only the total data size
+            uint32_t TotalSize = ActiveDataLen;
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                                ValidProperty, AtomIncr, 32, 1, &TotalSize);
+            Reply.property = ValidProperty;
+        } 
+        
+        /// B. Single-Shot Transmission (For Small Files like Text)
+        else {
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                                ValidProperty, ActiveDataType, 8, ActiveDataLen, ActiveData);
+            Reply.property = ValidProperty;
+        }
+    }
+
+    /// 5. Send the final Notification back to the Requestor
+    xcb_send_event(Connection, 0, Req->requestor, XCB_EVENT_MASK_NO_EVENT, (const char *)&Reply);
+    xcb_flush(Connection);
+    
+    xExit1("HandleSelectionRequest");
+}
+
+/// @brief The main loop that manages X11 connections and dispatches events.
 RetType XClipboardRuntime(int Param) {
     xEntry1("XClipboardRuntime");
 
@@ -416,14 +551,49 @@ RetType XClipboardRuntime(int Param) {
         /* Check for manual injection first */
         if (ReqTestInject == 1) {
             ReqTestInject = 0;
-            const char *TestStr = "Hello from Phu's Clipboard! Khai code thành công :>";
-            SetClipboardData(Connection, MyWindow, (void *)TestStr, strlen(TestStr), AtomUtf8);
+            sClipboardItem LatestItem;
+            
+            /// 1. Get the latest item to check its FileType
+            if (XCBList_GetLatestItem(&LatestItem) == OKE) {
+                
+                /// 2. Map FileType to X11 Atom
+                xcb_atom_t TargetAtom = AtomUtf8; /// Default
+                if (LatestItem.FileType == eFMT_IMG_PNG) {
+                    TargetAtom = AtomPng;
+                } else if (LatestItem.FileType == eFMT_IMG_JGP) {
+                    TargetAtom = AtomJpeg;
+                }
+
+                /// 3. Allocate a static buffer (Fix: Added uint8_t and standard 8MB size)
+                static uint8_t RawData[8U * 1024U * 1024U]; 
+                
+                /// 4. Get EXACT file size to avoid pasting 8MB of memory garbage
+                char FullPath[PATH_MAX];
+                snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, LatestItem.Filename);
+                struct stat FileStat;
+                
+                if (stat(FullPath, &FileStat) == 0 && FileStat.st_size > 0 && FileStat.st_size <= sizeof(RawData)) {
+                    
+                    /// 5. Read binary and inject EXACT size
+                    if (XCBList_ReadAsBinary(1, RawData, sizeof(RawData)) >= 0) {
+                        SetClipboardData(Connection, MyWindow, (void *)RawData, FileStat.st_size, TargetAtom);
+                        xLog1("[XClipboardRuntime] Injected %s (%ld bytes) as Atom %u", 
+                              LatestItem.Filename, FileStat.st_size, TargetAtom);
+                    } else {
+                        xWarn2("[XClipboardRuntime] ReadAsBinary failed!");
+                    }
+                } else {
+                    xWarn2("[XClipboardRuntime] File missing, empty, or exceeds 8MB buffer!");
+                }
+            } else {
+                xWarn2("[XClipboardRuntime] DB is empty, nothing to inject!");
+            }
         }
 
         Event = xcb_poll_for_event(Connection);
         if (Event == NULL) {
             if (xcb_connection_has_error(Connection)) break;
-            usleep(100U /*ms*/ * 1000U /*us*/);
+            usleep(50U /*ms*/ * 1000U /*us*/);
             continue;
         }
 
@@ -438,6 +608,9 @@ RetType XClipboardRuntime(int Param) {
         }
         else if (EventType == XCB_SELECTION_REQUEST) {
             HandleSelectionRequest(Event);
+        }
+        else if (EventType == XCB_PROPERTY_NOTIFY) {
+            HandlePropertyNotify(Event);
         }
 
         free(Event);
@@ -486,6 +659,10 @@ RetType ClipboardCaptureInitialize(void) {
     if (EnsureDB() != OKE) {
         xError("[Initialize] System Check Failed!");
         return ERR; 
+    }
+
+    if(XCBList_Scan(0)!=OKE){
+        xError("[Initialize] Scan DB failed!");
     }
 
     /* 3. Create Thread 1: Signal Runtime */
