@@ -2,3 +2,6 @@
 	path = xUniversal
 	url = https://github.com/ngxx-fus/xUniversal.git
 	branch = release
+[submodule "Doc/doxygen-awesome-css"]
+	path = Doc/doxygen-awesome-css
+	url = https://github.com/jothepro/doxygen-awesome-css.git

@@ -200,6 +200,40 @@ xcb_atom_t GetAtomByName(xcb_connection_t *c, const char *name) {
 }
 
 /**
+ * @brief Ensures that only one instance of xClipBoardCapture is running.
+ * @return OKE if this is the first instance, ERR otherwise.
+ */
+RetType CheckSingleInstance(xcb_connection_t *c, xcb_window_t win) {
+    /// 1. Intern a unique Atom name for our application lock
+    xcb_atom_t LockAtom = GetAtomByName(c, "CLIPBOARD_CAPTURE_SINGLE_INSTANCE_LOCK");
+
+    /// 2. Query the X Server: "Who is the current owner of this lock?"
+    xcb_get_selection_owner_cookie_t cookie = xcb_get_selection_owner(c, LockAtom);
+    xcb_get_selection_owner_reply_t *reply = xcb_get_selection_owner_reply(c, cookie, NULL);
+
+    if (reply && reply->owner != XCB_NONE) {
+        /// If the owner is NOT NONE, it means another process (App 1) is already holding it.
+        free(reply);
+        return ERR; 
+    }
+    if (reply) free(reply);
+
+    /// 3. If we reached here, no one owns it. Now, we claim it!
+    xcb_set_selection_owner(c, win, LockAtom, XCB_CURRENT_TIME);
+    
+    /// Double check to be sure we are the real owner
+    cookie = xcb_get_selection_owner(c, LockAtom);
+    reply = xcb_get_selection_owner_reply(c, cookie, NULL);
+    if (reply && reply->owner == win) {
+        free(reply);
+        return OKE;
+    }
+
+    if (reply) free(reply);
+    return ERR;
+}
+
+/**
  * @brief Initializes all global atoms used by the application.
  * @param c The XCB connection.
  * @note Must be called before initiating any clipboard transactions.
@@ -796,6 +830,12 @@ RetType XClipboardRuntime(int Param) {
     InitAtoms(Connection);
     MyWindow = CreateListenerWindow(Connection);
     SubscribeClipboardEvents(Connection, MyWindow);
+
+    if(CheckSingleInstance(Connection, MyWindow) != OKE){
+        xError("[XClipboardRuntime] Another app already started! Please close it before start again!");
+        ClipboardCaptureFinalize();
+        exit(-1);
+    }
 
     xLog1("[XClipboardRuntime] Listening for Clipboard events...");
     xcb_generic_event_t *Event;

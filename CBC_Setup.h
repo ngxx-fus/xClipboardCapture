@@ -63,7 +63,7 @@
 /**
  * @brief Root directory for all temporary runtime files.
  */
-#define PATH_DIR_ROOT           "/home/fus/Documents/ClipboardCaputure/.tmp"
+#define PATH_DIR_ROOT           "/home/fus/.fus/.XCBC_Data"
 
 /**
  * @brief Sub-directory storing the raw clipboard data chunks/files.

@@ -52,6 +52,12 @@ $(BIN): $(OBJS)
 	@echo ">>> Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
+restart: all
+	@echo ">>> Restarting xClipBoardCapture..."
+	@pkill -SIGINT $(BIN) || true
+	@sleep 0.5
+	@./$(BIN) &
+
 # [NEW]: Install target to deploy the binary to $(HOME)/.fus/
 install: all
 	@echo ">>> Installing to $(INSTALL_PATH_DIR)..."
