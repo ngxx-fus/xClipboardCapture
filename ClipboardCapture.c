@@ -471,7 +471,7 @@ void HandlePropertyNotify(xcb_generic_event_t *Event) {
 }
 
 /// @brief Handles Selection Request events, providing clipboard data to other apps.
-void HandleSelectionRequest(xcb_generic_event_t *Event) {
+void HandleSelectionRequest_old(xcb_generic_event_t *Event) {
     xEntry1("HandleSelectionRequest");
     xcb_selection_request_event_t *Req = (xcb_selection_request_event_t *)Event;
     
@@ -529,6 +529,84 @@ void HandleSelectionRequest(xcb_generic_event_t *Event) {
             }
         } 
         else {
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                                ValidProperty, ActiveDataType, 8, ActiveDataLen, ActiveData);
+            Reply.property = ValidProperty;
+        }
+    }
+
+    xcb_send_event(Connection, 0, Req->requestor, XCB_EVENT_MASK_NO_EVENT, (const char *)&Reply);
+    xcb_flush(Connection);
+    
+    xExit1("HandleSelectionRequest");
+}
+
+/// @brief Handles Selection Request events, providing clipboard data to other apps.
+/// @param Event The generic XCB event containing the selection request.
+void HandleSelectionRequest(xcb_generic_event_t *Event) {
+    xEntry1("HandleSelectionRequest");
+    xcb_selection_request_event_t *Req = (xcb_selection_request_event_t *)Event;
+    
+    xLog1("[XClipboardRuntime] [Event] SelectionRequest from window: %u for target: %u", 
+          Req->requestor, Req->target);
+
+    xcb_selection_notify_event_t Reply;
+    memset(&Reply, 0, sizeof(Reply));
+    Reply.response_type = XCB_SELECTION_NOTIFY;
+    Reply.requestor     = Req->requestor;
+    Reply.selection     = Req->selection;
+    Reply.target        = Req->target;
+    Reply.time          = Req->time;
+    
+    xcb_atom_t ValidProperty = (Req->property == XCB_NONE) ? Req->target : Req->property;
+    Reply.property = XCB_NONE; 
+
+    if (Req->target == AtomTarget) { 
+        xcb_atom_t SupportedTargets[] = { AtomTarget, AtomTimestamp, ActiveDataType };
+        int NumTargets = sizeof(SupportedTargets) / sizeof(xcb_atom_t);
+        
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                            ValidProperty, XCB_ATOM_ATOM, 32, NumTargets, SupportedTargets);
+        Reply.property = ValidProperty;
+    }
+    else if (Req->target == AtomTimestamp) {
+        xcb_timestamp_t CurrentTime = Req->time; 
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                            ValidProperty, XCB_ATOM_INTEGER, 32, 1, &CurrentTime);
+        Reply.property = ValidProperty;
+    }
+    else if (Req->target == ActiveDataType && ActiveData != NULL) {
+        if (ActiveDataLen > INCR_CHUNK_SIZE) {
+            
+            /// [FIX DEADLOCK]: Ruthlessly abort any stuck INCR transfer if a new request arrives!
+            if (IncrData != NULL) {
+                xLog1("[INCR] Alert! Aborting stuck transfer to serve new request from Window: %u", Req->requestor);
+                IncrData = NULL;
+                IncrOffset = 0;
+                IncrRequestor = XCB_NONE;
+            }
+
+            xLog1("[XRuntime] Data > 64KB. Starting INCR Protocol...");
+
+            IncrData = ActiveData;
+            IncrDataLen = ActiveDataLen;
+            IncrOffset = 0;
+            IncrRequestor = Req->requestor;
+            IncrProperty = ValidProperty;
+            IncrTarget = ActiveDataType;
+
+            /// Ensure we can hear the requestor deleting the property to send the next chunks
+            uint32_t event_mask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
+            xcb_change_window_attributes(Connection, Req->requestor, XCB_CW_EVENT_MASK, event_mask);
+
+            /// Tell the requestor we are starting an INCR transfer and give them the total size
+            uint32_t TotalSize = ActiveDataLen;
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
+                                ValidProperty, AtomIncr, 32, 1, &TotalSize);
+            Reply.property = ValidProperty;
+        } 
+        else {
+            /// Send normally if it fits in one chunk
             xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
                                 ValidProperty, ActiveDataType, 8, ActiveDataLen, ActiveData);
             Reply.property = ValidProperty;
@@ -776,14 +854,15 @@ RetType ClipboardCaptureInitialize(void) {
         for (int i = 0; i < size; i++) {
             sClipboardItem item;
             if (XCBList_GetItem(i, &item) == OKE) {
-                /// Gọi hàm Helper để nó tự đọc và ghi vào file tmp
                 WriteRofiMenuItem(tmp, i, &item);
             }
         }
         fclose(tmp);
 
         /// 3. Execute Rofi and capture its output
-        FILE *rofi = popen("rofi -dmenu -i -show-icons -p 'X11 Clipboard' < /tmp/cbc_rofi.txt", "r");
+        static char RofiCmd[512]; 
+        snprintf(RofiCmd, sizeof(RofiCmd), "rofi -dmenu -i -show-icons -p 'X11 Clipboard' < %s", PATH_FILE_ROFI_MENU);
+        FILE *rofi = popen(RofiCmd, "r");
         if (!rofi) {
             xError("[UI] Failed to execute Rofi.");
             return;
