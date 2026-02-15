@@ -11,6 +11,8 @@ static sClipboardItem   XCBList[MAX_HISTORY_ITEMS];
 static int              XCBListSize = 0;
 static int              HeadIndex   = -1;
 static pthread_mutex_t  ListMutex = PTHREAD_MUTEX_INITIALIZER;
+static int              XCBList_SelectedItem = -1;
+
 
 /**************************************************************************************************
  * LOCKING HELPERS *******************************************************************************
@@ -90,6 +92,50 @@ RetType GetFileNameFromPath(char *Path, char *OutputFileName, int MaxFileNameSiz
     OutputFileName[MaxFileNameSize - 1] = '\0';
     return OKE;
 }
+
+
+/**
+ * @brief Helper to generate a unique filename based on current time.
+ * @param buffer Output buffer for the filename.
+ * @param size Size of the buffer.
+ */
+void GetTimeBasedFilenameTxt(char *buffer, size_t size) {
+    time_t rawtime;
+    struct tm *timeinfo;
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    /* Format: YYYYMMDD_HHMMSS.txt */
+    strftime(buffer, size, "%Y%m%d_%H%M%S.txt", timeinfo);
+}
+
+/**
+ * @brief Helper to generate a filename based on current time with optional extension.
+ * @param buffer Output buffer for the filename.
+ * @param size Size of the buffer.
+ * @param ext Extension string (e.g., "png", "txt"). If NULL, no extension is added.
+ */
+void GetTimeBasedFilename(char *buffer, size_t size, const char *ext) {
+    time_t rawtime;
+    struct tm *timeinfo;
+    char TimeStr[64];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    /* 1. Generate the base timestamp: YYYYMMDD_HHMMSS */
+    strftime(TimeStr, sizeof(TimeStr), "%Y%m%d_%H%M%S", timeinfo);
+
+    /* 2. Handle extension logic */
+    if (ext == NULL || ext[0] == '\0') {
+        /// If ext is NULL, just copy the timestamp
+        snprintf(buffer, size, "%s", TimeStr);
+    } else {
+        /// If ext exists, append it with a dot
+        snprintf(buffer, size, "%s.%s", TimeStr, ext);
+    }
+}
+
+
 
 /**************************************************************************************************
  * PUBLIC LIST IMPLEMENTATION *********************************************************************
@@ -255,6 +301,60 @@ RetType XCBList_ReadAsBinary(int n, void* Output, int MaxOutputSize) {
     xLog1("[XCBList_ReadAsBinary] ReadSize=%d", ReadSize);
     
     return (ReadSize == (size_t)FileSize) ? OKE : ERR;
+}
+
+int XCBList_SetSelectedNum(int LinearIndex) {
+    LockList();
+    
+    if (LinearIndex < 0 || LinearIndex >= XCBListSize) {
+        xError("[XCBList_SetSelectedNum] Invalid index = %d", LinearIndex);
+        UnlockList();
+        return ERR;
+    }
+    
+    XCBList_SelectedItem = LinearIndex;
+    UnlockList();
+    
+    return OKE;
+}
+
+int XCBList_GetSelectedNum(void) {
+    int SelectedNum;
+    
+    LockList();
+    SelectedNum = XCBList_SelectedItem;
+    UnlockList();
+    
+    if(SelectedNum < 0 || SelectedNum >= XCBListSize) {
+        SelectedNum = 0;
+    }
+
+    return SelectedNum;
+}
+
+int XCBList_GetSelectedItem(sClipboardItem *Output) {
+    LockList();
+    
+    /// 1. Check if a valid item is currently selected
+    if (XCBList_SelectedItem < 0 || XCBList_SelectedItem >= XCBListSize) {
+        UnlockList();
+        return ERR;
+    }
+    
+    /// 2. Convert the logical UI index to the physical ring buffer index
+    int AllocIdx = Convert2AllocatedIndex(XCBList_SelectedItem);
+    if (AllocIdx < 0) {
+        UnlockList();
+        return ERR;
+    }
+    
+    /// 3. Copy data if Output is provided
+    if (Output != NULL) {
+        memcpy(Output, &XCBList[AllocIdx], sizeof(sClipboardItem));
+    }
+    
+    UnlockList();
+    return OKE;
 }
 
 /**************************************************************************************************

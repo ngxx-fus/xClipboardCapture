@@ -35,21 +35,6 @@ xcb_window_t CreateListenerWindow(xcb_connection_t *c);
  */
 void SubscribeClipboardEvents(xcb_connection_t *c, xcb_window_t window);
 
-/**
- * @brief Helper to generate a unique filename based on current time.
- * @param buffer Output buffer for the filename.
- * @param size Size of the buffer.
- */
-void GetTimeBasedFilenameTxt(char *buffer, size_t size);
-
-/**
- * @brief Helper to generate a filename based on current time with optional extension.
- * @param buffer Output buffer for the filename.
- * @param size Size of the buffer.
- * @param ext Extension string (e.g., "png", "txt"). If NULL, no extension is added.
- */
-void GetTimeBasedFilename(char *buffer, size_t size, const char *ext);
-
 /**************************************************************************************************
  * CLIPBOARD PROVIDER SECTION PROTOTYPES **********************************************************
  **************************************************************************************************/ 
