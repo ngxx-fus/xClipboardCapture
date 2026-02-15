@@ -109,4 +109,29 @@ void ClipboardCaptureFinalize(void);
  */
 RetType ClipboardCaptureInitialize(void);
 
+/**************************************************************************************************
+ * ROFI SUPPORT ***********************************************************************************
+ **************************************************************************************************/ 
+
+#if (ROFI_SUPPORT==1)
+
+    /// @brief Reads file content and writes a formatted Rofi menu item directly to the temp file.
+    /// @param OutFile The temporary file stream (/tmp/cbc_rofi.txt).
+    /// @param Index The logical index of the clipboard item.
+    /// @param Item Pointer to the clipboard item data.
+    /// @return OKE on success.
+    RetType WriteRofiMenuItem(FILE *OutFile, int Index, sClipboardItem *Item);
+    
+    /// @brief Calls the Rofi dmenu interface to let the user select a clipboard item.
+    void ShowRofiMenu(void);
+
+#endif /*ROFI_SUPPORT*/
+
+
 #endif /*__CLIPBOARD_CAPTURE_H__*/
+
+/**************************************************************************************************
+ * EOF ********************************************************************************************
+ **************************************************************************************************/ 
+
+
