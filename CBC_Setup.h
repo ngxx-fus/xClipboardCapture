@@ -45,10 +45,7 @@
 
 #define MAX_HISTORY_ITEMS   1000 
 
-
-/**************************************************************************************************
- * CONFIG/DECLARE SECTION *************************************************************************
- **************************************************************************************************/ 
+#define ROFI_SUPPORT        1
 
 enum eTogglePopUpStatus {eNOT_STARTED, eREQ_START, eREQ_HIDE, eHIDEN, eREQ_SHOW, eSHOWN};
 enum eBinaryState {eACTIVATE = 1, eDEACTIVATE = 0};
