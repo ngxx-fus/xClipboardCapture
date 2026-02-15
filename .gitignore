@@ -24,4 +24,5 @@ xUniversal/Build/
 *.log
 *.swp
 
-
+# Ignore callgrind
+callgrind.out.*
