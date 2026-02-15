@@ -4,51 +4,93 @@
 #include <xUniversal.h>
 
 /**************************************************************************************************
- * GLOBAL VARIABLES & ATOMS SECTION ***************************************************************
+ * X11 ATOMS SECTION ******************************************************************************
  **************************************************************************************************/ 
 
-/// @brief Core X11 Atoms used for clipboard communication.
+/// @brief Atom representing the X11 CLIPBOARD selection.
 xcb_atom_t              AtomClipboard;
+/// @brief Atom representing UTF8_STRING text format.
 xcb_atom_t              AtomUtf8;
+/// @brief Atom used to request supported data formats (TARGETS negotiation).
 xcb_atom_t              AtomTarget;
+/// @brief Atom representing PNG image MIME type ("image/png").
 xcb_atom_t              AtomPng;
+/// @brief Atom representing JPEG image MIME type ("image/jpeg").
 xcb_atom_t              AtomJpeg;
+/// @brief Custom property Atom used as a temporary buffer for selection transfers.
 xcb_atom_t              AtomProperty;
+/// @brief Atom representing TIMESTAMP target for clipboard ownership time.
 xcb_atom_t              AtomTimestamp;
+/// @brief Atom indicating usage of the INCR protocol for large transfers.
 xcb_atom_t              AtomIncr;
 
-/// @brief Global variables to hold the data we want to "paste" to other apps.
+/**************************************************************************************************
+ * ACTIVE CLIPBOARD DATA SECTION ******************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Pointer to the active data (text/image) currently held in the clipboard.
 void * ActiveData = NULL;
+/// @brief Size of the active clipboard data in bytes.
 size_t                  ActiveDataLen = 0;
-xcb_atom_t              ActiveDataType = 0; /// E.g., AtomUtf8 or AtomPng
+/// @brief The X11 Atom representing the format of the active data (e.g., AtomUtf8 or AtomPng).
+xcb_atom_t              ActiveDataType = 0;
 
-/// @brief X11 Connection and Listener Window.
-xcb_window_t            MyWindow                = 0;
-xcb_connection_t *      Connection              = NULL;
+/**************************************************************************************************
+ * X11 CORE & CONNECTION SECTION ******************************************************************
+ **************************************************************************************************/ 
 
-/// @brief Inter-thread signaling flags.
+/// @brief Hidden X11 window used to listen for clipboard events.
+xcb_window_t            MyWindow = 0;
+/// @brief Pointer to the active XCB connection.
+xcb_connection_t * Connection = NULL;
+
+/**************************************************************************************************
+ * THREADS & SIGNALS SECTION **********************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Flag to trigger the UI popup menu (eREQ_SHOW, eREQ_HIDE, or eNOT_STARTED).
 volatile sig_atomic_t   TogglePopUpStatus = eNOT_STARTED;
-volatile sig_atomic_t   RequestExit       = eDEACTIVATE;
-volatile sig_atomic_t   ReqTestInject     = eDEACTIVATE;
+/// @brief Flag to signal all threads to gracefully exit.
+volatile sig_atomic_t   RequestExit = eDEACTIVATE;
+/// @brief Flag to trigger the injection of the selected clipboard item into the active window.
+volatile sig_atomic_t   ReqTestInject = eDEACTIVATE;
 
-/// @brief Application worker threads.
-static pthread_t        SignalRuntimeThread;    /// Thread 1: OS Signal Handling
-static pthread_t        XClipboardRuntimeThread; /// Thread 2: X11 Clipboard Logic
+/// @brief Thread handle for the OS signal listener (SIGUSR1, SIGINT).
+static pthread_t        SignalRuntimeThread;
+/// @brief Thread handle for the main X11 event loop and clipboard logic.
+static pthread_t        XClipboardRuntimeThread;
 
+/**************************************************************************************************
+ * INCR PROTOCOL (PROVIDER) SECTION ***************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Maximum chunk size (64KB) for INCR protocol transfers.
 #define                 INCR_CHUNK_SIZE 65536
 
-/// @brief INCR Provider (Sender) State Machine Variables.
-uint8_t *               IncrData = NULL;
+/// @brief Pointer to the data currently being transmitted via INCR protocol.
+uint8_t * IncrData = NULL;
+/// @brief Total size of the data being transmitted via INCR protocol.
 size_t                  IncrDataLen = 0;
+/// @brief Current byte offset of the INCR transmission.
 size_t                  IncrOffset = 0;
+/// @brief The window ID of the application requesting the INCR transfer.
 xcb_window_t            IncrRequestor = XCB_NONE;
+/// @brief The property atom used for the current INCR transfer.
 xcb_atom_t              IncrProperty = XCB_NONE;
+/// @brief The target format atom of the current INCR transfer.
 xcb_atom_t              IncrTarget = XCB_NONE;
 
-/// @brief INCR Receiver State Machine Variables.
+/**************************************************************************************************
+ * INCR PROTOCOL (RECEIVER) SECTION ***************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Flag indicating if the application is currently receiving an INCR transfer.
 int                     IsReceivingIncr = 0;
-FILE *                  IncrRecvFile    = NULL;
+/// @brief File pointer used to append incoming INCR chunks to disk.
+FILE * IncrRecvFile = NULL;
+/// @brief Filename of the current INCR transfer being received.
 char                    IncrRecvFilename[NAME_MAX];
+
 
 /**************************************************************************************************
  * X11 SERVER SETUP SECTION ***********************************************************************
@@ -190,10 +232,6 @@ void SignalEventHandler(int SigNum) {
         xLog1("[SignalEventHandler] Activate RequestExit!");
     } 
     else if (SigNum == SIGUSR1) {
-        /// Custom signal received from another terminal (e.g., pkill -SIGUSR1)
-        xLog1("[SignalEventHandler] Injecting selected item into X11 Clipboard...");
-        ReqTestInject = eACTIVATE;
-        
         /// Toggle PopUp visibility state
         if (TogglePopUpStatus == eHIDEN || TogglePopUpStatus == eNOT_STARTED) {
             TogglePopUpStatus = eREQ_SHOW;
@@ -202,6 +240,11 @@ void SignalEventHandler(int SigNum) {
             TogglePopUpStatus = eREQ_HIDE;
         }
     }
+    else if (SigNum == SIGUSR2) {
+        /// Custom signal received from another terminal (e.g., pkill -SIGUSR2)
+        xLog1("[SignalEventHandler] Injecting selected item into X11 Clipboard...");
+        ReqTestInject = eACTIVATE;
+    }
 }
 
 /// @brief Registers the application's signal handlers with the Operating System.
@@ -209,6 +252,7 @@ void SignalEventHandler(int SigNum) {
 RetType RegisterSignal(void) {
     xEntry1("RegisterSignal");
 
+    signal(SIGUSR2, SignalEventHandler); /// Catch custom command
     signal(SIGUSR1, SignalEventHandler); /// Catch custom command
     signal(SIGINT,  SignalEventHandler); /// Catch Ctrl+C
     signal(SIGTERM, SignalEventHandler); /// Catch standard kill command

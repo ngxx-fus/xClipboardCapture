@@ -5,6 +5,17 @@
 #include "CBC_SysFile.h"
 
 /**************************************************************************************************
+ * GLOBAL VARIABLES & ATOMS SECTION ***************************************************************
+ **************************************************************************************************/ 
+
+/// @brief Flag to trigger the UI popup menu (eREQ_SHOW, eREQ_HIDE, or eNOT_STARTED).
+extern volatile sig_atomic_t   TogglePopUpStatus;
+/// @brief Flag to signal all threads to gracefully exit.
+extern volatile sig_atomic_t   RequestExit;
+/// @brief Flag to trigger the injection of the selected clipboard item into the active window.
+extern volatile sig_atomic_t   ReqTestInject;
+
+/**************************************************************************************************
  * X11 SERVER SECTION PROTOTYPES ******************************************************************
  **************************************************************************************************/ 
 

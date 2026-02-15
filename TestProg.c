@@ -2,33 +2,130 @@
 #include <xUniversal.h>
 #include "ClipboardCapture.h"
 
+
+/// @brief Calls the Rofi dmenu interface to let the user select a clipboard item.
+void ShowRofiMenu(void) {
+    xEntry1("ShowRofiMenu");
+    
+    /// 1. Create a temporary file to hold the menu items
+    FILE *tmp = fopen("/tmp/cbc_rofi.txt", "w");
+    if (!tmp) {
+        xError("[UI] Failed to create temp file for Rofi.");
+        return;
+    }
+
+    /// 2. Dump the current RAM list into the text file
+    int size = XCBList_GetItemSize();
+    for (int i = 0; i < size; i++) {
+        sClipboardItem item;
+        if (XCBList_GetItem(i, &item) == OKE) {
+            /// Format: "Index: Filename" (e.g., "0: 20260215_182909.png")
+            fprintf(tmp, "%d: %s\n", i, item.Filename);
+        }
+    }
+    fclose(tmp);
+
+    /// 3. Execute Rofi and capture its output
+    /// -dmenu: Read from standard input (redirected from our temp file)
+    /// -i: Case-insensitive search
+    /// -p: Set the prompt text
+    FILE *rofi = popen("rofi -dmenu -i -p 'X11 Clipboard' < /tmp/cbc_rofi.txt", "r");
+    if (!rofi) {
+        xError("[UI] Failed to execute Rofi.");
+        return;
+    }
+
+    char result[256];
+    
+    /// 4. fgets will block and wait until the user selects an item or presses ESC
+    if (fgets(result, sizeof(result), rofi) != NULL) {
+        
+        /// 5. Parse the selected index from the returned string
+        int selected_index = -1;
+        if (sscanf(result, "%d:", &selected_index) == 1) {
+            xLog1("[UI] User selected index: %d", selected_index);
+            
+            /// 6. Set the logical index and trigger the X11 injection
+            if (XCBList_SetSelectedNum(selected_index) == OKE) {
+                ReqTestInject = eACTIVATE;
+            }
+        }
+    } else {
+        xLog1("[UI] User cancelled Rofi (pressed ESC).");
+    }
+
+    pclose(rofi);
+    xExit1("ShowRofiMenu");
+}
+
+/// @brief Main entry point. Initializes systems and runs the UI event loop.
+/// @param argc Argument count.
+/// @param argv Argument vector.
+/// @return 0 on success, -1 on initialization failure.
 int main(int argc, char *argv[]) {
-    /* 1. Khởi tạo 2 luồng chạy ngầm (Signal + X11) */
+    /// 1. Initialize background threads (Signal + X11)
     if (ClipboardCaptureInitialize() != OKE) {
         return -1;
     }
 
-    xLog1("[Main] Systems initialized. Main thread is entering idle loop...");
+    xLog1("[Main] Systems initialized. Main thread is entering UI loop...");
 
-    /* 2. Vòng lặp giữ nhịp cho Main Thread */
-    /* Sau này chỗ này sẽ là while(running) của SDL2 */
+    /// 2. Main UI Event Loop
     while (RequestExit != eACTIVATE) {
         
-        // Giả lập công việc của Main thread hoặc đơn giản là ngủ để tiết kiệm CPU
-        // 200ms check một lần là quá đủ cho luồng chính lúc này
-        usleep(200000); 
+        /// Check if the Signal Thread requested the popup menu (via SIGUSR1)
+        if (TogglePopUpStatus == eREQ_SHOW) {
+            ShowRofiMenu();
+            
+            /// Reset the popup status to hidden after the menu closes
+            TogglePopUpStatus = eHIDEN;
+        }
         
-        // Phú có thể thêm một dòng log "tưng tửng" ở đây để biết main còn sống
-        // xLog2("[Main] Heartbeat..."); 
+        /// Sleep 10ms to prevent 100% CPU usage while idling
+        usleep(10000); 
     }
 
     xLog1("[Main] Exit signal detected. Cleaning up...");
 
-    /* 3. Kết thúc */
-    /* atexit(ClipboardCaptureFinalize) đã được đăng ký trong Initialize 
-       nên nó sẽ tự động được gọi khi return 0 */
+    /// 3. Cleanup is handled automatically by atexit(ClipboardCaptureFinalize)
     return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// int main(int argc, char *argv[]) {
 ///     sClipboardItem TempItem;
