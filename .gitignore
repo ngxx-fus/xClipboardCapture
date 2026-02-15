@@ -1,1 +1,27 @@
-.tmp/*
+# ==========================================
+# Git Ignore Configuration for ClipboardCapture
+# ==========================================
+
+# === Build Artifacts ===
+# Ignore object files generated during compilation
+*.o
+
+# Ignore the final executable binary
+xClipBoardCapture
+
+# === Temporary & Database Files ===
+# Ignore the entire temporary directory and stored clipboard data.
+# We only want to track source code, not 1000 cat pictures in the DB.
+.tmp/
+
+# === Submodule Artifacts ===
+# The Build directory inside the submodule contains packaged .so files and headers.
+# Ignore this to ensure a clean rebuild when moving to a different machine.
+xUniversal/Build/
+
+# === Development & Editor Files ===
+# Ignore log files and Vim swap files
+*.log
+*.swp
+
+
