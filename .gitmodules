@@ -1,0 +1,4 @@
+[submodule "xUniversal"]
+	path = xUniversal
+	url = https://github.com/ngxx-fus/xUniversal.git
+	branch = release

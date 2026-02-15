@@ -1,35 +1,57 @@
-# ==========================================
-# Modernized Makefile for ClipboardCapture
-# ==========================================
+# ==============================================================================
+# Makefile with xUniversal Submodule Integration
+# ==============================================================================
 
-CC = gcc
+CC      = gcc
 
-# Compiler flags: Include current dir (-I.), enable warnings, optimize (-O2)
-CFLAGS = -std=gnu11 -O2 -Wall -I. $(shell sdl2-config --cflags)
+# --- Submodule Configuration ---
+XUNIV_DIR      = ./xUniversal
+XUNIV_BUILD    = $(XUNIV_DIR)/Build
+XUNIV_INC_PATH = $(XUNIV_BUILD)/include
+XUNIV_LIB_PATH = $(XUNIV_BUILD)/lib
 
-# Linker flags: Cleaned up duplicates, added -lpthread for future multi-threading
-LDFLAGS = $(shell sdl2-config --libs) -lxcb -lxcb-xfixes -lz -lxuniversal -lpthread
+# --- Compiler Flags ---
+# -I.              : Include headers from current directory
+# -I$(XUNIV_INC_PATH): Include headers from xUniversal Build folder
+CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -I. -I$(XUNIV_INC_PATH)
 
-# Source files
-TEST_SRC = *.c 
+# --- Linker Flags ---
+# -L$(XUNIV_LIB_PATH): Tell linker where to find libxuniversal.so
+# -Wl,-rpath,...     : Hardcode the library path into the binary so it runs 
+#                      without needing LD_LIBRARY_PATH or installing to /usr/lib
+LDFLAGS = -L$(XUNIV_LIB_PATH) -Wl,-rpath,$(XUNIV_LIB_PATH) \
+          -lxcb -lxcb-xfixes -lz -lxuniversal -lpthread
 
-# Header files (Crucial for tracking changes!)
-HEADERS = CBC_Setup.h CBC_SysFile.h ClipboardCapture.h
+# --- Project Files ---
+SRCS    = $(wildcard *.c)
+HEADERS = $(wildcard *.h)
+OBJS    = $(SRCS:.c=.o)
+BIN     = xClipBoardCapture
 
-# Output binary
-TEST_BIN = TestProg
+# --- Targets ---
+.PHONY: all clean xuniversal_build
 
-.PHONY: all clean
+# Default target: build submodule first, then build the main app
+all: xuniversal_build $(BIN)
 
-all: $(TEST_BIN)
+# Trigger the Makefile inside xUniversal submodule
+xuniversal_build:
+	@echo ">>> Checking xUniversal Submodule..."
+	@$(MAKE) -C $(XUNIV_DIR)
 
-# The binary depends on BOTH source files AND header files.
-# If ANY of these files change, it will recompile.
-$(TEST_BIN): $(TEST_SRC) $(HEADERS)
-	@echo ">>> Compiling $(TEST_BIN)..."
-	$(CC) $(CFLAGS) $(TEST_SRC) -o $(TEST_BIN) $(LDFLAGS)
+# Link all compiled object files into the final binary
+$(BIN): $(OBJS)
+	@echo ">>> Linking $(BIN)..."
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo ">>> Build successful!"
 
+# Pattern rule to compile each .c file into a .o file
+%.o: %.c $(HEADERS)
+	@echo ">>> Compiling $<..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
-	@echo ">>> Cleaning up..."
-	rm -f $(TEST_BIN)
+	@echo ">>> Cleaning up ClipboardCapture..."
+	rm -f $(BIN) $(OBJS)
+	@echo ">>> Cleaning up xUniversal Submodule..."
+	@$(MAKE) -C $(XUNIV_DIR) clean
