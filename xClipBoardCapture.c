@@ -1,4 +1,5 @@
-#define XLOG_LEVEL 1
+#define XLOG_EN     0
+#define XLOG_LEVEL  0
 #include <xUniversal.h>
 #include "ClipboardCapture.h"
 

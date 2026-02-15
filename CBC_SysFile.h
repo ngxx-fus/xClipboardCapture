@@ -139,6 +139,13 @@ int XCBList_GetSelectedNum(void);
  */
 int XCBList_GetSelectedItem(sClipboardItem *Output);
 
+/**
+ * @brief Clears all clipboard items from both RAM and physical storage.
+ * @return The number of items successfully cleared, or ERR on system failure.
+ * @note This operation is irreversible as it deletes all files in PATH_DIR_DB.
+ */
+int XCBList_ClearAllItems(void);
+
 /**************************************************************************************************
  * SYSTEMCALL HELPER PROTOTYPES *******************************************************************
  **************************************************************************************************/ 

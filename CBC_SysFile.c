@@ -542,6 +542,52 @@ int XCBList_GetSelectedItem(sClipboardItem *Output) {
     return OKE;
 }
 
+/**
+ * @brief Clears all clipboard items from both RAM and physical storage.
+ */
+int XCBList_ClearAllItems(void) {
+    xEntry1("XCBList_ClearAllItems");
+    
+    int ClearedCount = 0;
+    
+    /// 1. Lock the list to prevent race conditions during cleanup
+    LockList();
+    
+    ClearedCount = XCBListSize;
+
+    /// 2. Wipe the physical database directory
+    /// We use RemoveDir to delete the DB folder and all its content
+    if (RemoveDir(PATH_DIR_DB) == OKE) {
+        xLog1("[XCBList] Physical database cleared.");
+        
+        /// 3. Re-create the empty DB directory for future use
+        if (EnsureDir(PATH_DIR_DB) != OKE) {
+            xError("[XCBList] Failed to re-create DB directory!");
+            UnlockList();
+            return ERR;
+        }
+    } else {
+        xError("[XCBList] Failed to remove physical DB directory!");
+        UnlockList();
+        return ERR;
+    }
+
+    /// 4. Reset internal RAM state (Circle Buffer indicators)
+    XCBListSize = 0;
+    HeadIndex   = -1;
+    XCBList_SelectedItem = -1;
+    
+    /// Optional: Clean the memory array (though not strictly required for a ring buffer)
+    memset(XCBList, 0, sizeof(XCBList));
+
+    UnlockList();
+    
+    xLog1("[XCBList] Successfully cleared %d items.", ClearedCount);
+    xExit1("XCBList_ClearAllItems");
+    
+    return ClearedCount;
+}
+
 /**************************************************************************************************
  * SYSTEMCALL HELPER SECTION **********************************************************************
  **************************************************************************************************/ 
@@ -556,7 +602,7 @@ void PrintError_Mkdir(const char FunctionName[], const char Path[], int ErrorCod
     /// Interpret the POSIX error code to provide meaningful logs
     switch (ErrorCode) {
         case EEXIST:
-            xWarn2("[%s] Path already exists: %s", FunctionName, Path);
+            xWarn("[%s] Path already exists: %s", FunctionName, Path);
             break;
         case EACCES:
         case EPERM:

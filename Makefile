@@ -4,6 +4,8 @@
 
 CC      = gcc
 
+INSTALL_PATH_DIR=$(HOME)/.fus/
+
 # --- Submodule Configuration ---
 XUNIV_DIR      = ./xUniversal
 XUNIV_BUILD    = $(XUNIV_DIR)/Build
@@ -29,7 +31,7 @@ OBJS    = $(SRCS:.c=.o)
 BIN     = xClipBoardCapture
 
 # --- Targets ---
-.PHONY: all clean xuniversal_build
+.PHONY: all clean xuniversal_build install
 
 # Default target: build submodule first, then build the main app
 all: xuniversal_build $(BIN)
@@ -50,8 +52,16 @@ $(BIN): $(OBJS)
 	@echo ">>> Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# [NEW]: Install target to deploy the binary to $(HOME)/.fus/
+install: all
+	@echo ">>> Installing to $(INSTALL_PATH_DIR)..."
+	@mkdir -p $(INSTALL_PATH_DIR)
+	@cp $(BIN) $(INSTALL_PATH_DIR)
+	@echo ">>> Installation complete! You can now run it from $(INSTALL_PATH_DIR)$(BIN)"
+
 clean:
 	@echo ">>> Cleaning up ClipboardCapture..."
 	rm -f $(BIN) $(OBJS)
 	@echo ">>> Cleaning up xUniversal Submodule..."
 	@$(MAKE) -C $(XUNIV_DIR) clean
+

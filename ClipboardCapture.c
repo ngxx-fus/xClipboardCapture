@@ -1,7 +1,7 @@
 #include "ClipboardCapture.h"
 #include "CBC_Setup.h"
 #include "CBC_SysFile.h"
-#include <xUniversal.h>
+#include "xUniversal.h"
 
 /**************************************************************************************************
  * X11 ATOMS SECTION ******************************************************************************
@@ -189,13 +189,13 @@ xcb_atom_t GetAtomByName(xcb_connection_t *c, const char *name) {
     xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c, ck, NULL);
     
     if (!r) {
-        xExit("GetAtomByName(): XCB_ATOM_NONE, !r");
+        xExit1("GetAtomByName(): XCB_ATOM_NONE, !r");
         return XCB_ATOM_NONE;
     }
     
     xcb_atom_t a = r->atom;
     free(r);
-    xExit("GetAtomByName(): %u", a);
+    xExit1("GetAtomByName(): %u", a);
     return a;
 }
 
@@ -573,7 +573,7 @@ void HandleSelectionNotify(xcb_generic_event_t *Event) {
 
     /// If property is NONE, the owner rejected our request (unsupported format or timed out).
     if (Nevent->property == XCB_NONE) {
-        xWarn2("[XClipboardRuntime] [Event] Target conversion failed or denied by owner.");
+        xWarn("[XClipboardRuntime] [Event] Target conversion failed or denied by owner.");
         return;
     }
 
@@ -831,13 +831,13 @@ RetType XClipboardRuntime(int Param) {
                         xLog1("[XClipboardRuntime] Injected %s (%ld bytes) as Atom %u", 
                               LatestItem.Filename, FileStat.st_size, TargetAtom);
                     } else {
-                        xWarn2("[XClipboardRuntime] ReadAsBinary failed!");
+                        xWarn("[XClipboardRuntime] ReadAsBinary failed!");
                     }
                 } else {
-                    xWarn2("[XClipboardRuntime] File missing, empty, or exceeds 8MB buffer!");
+                    xWarn("[XClipboardRuntime] File missing, empty, or exceeds 8MB buffer!");
                 }
             } else {
-                xWarn2("[XClipboardRuntime] No item selected or DB is empty!");
+                xWarn("[XClipboardRuntime] No item selected or DB is empty!");
             }
         }
 
@@ -1025,7 +1025,6 @@ RetType ClipboardCaptureInitialize(void) {
 
     /**
      * @brief Calls the Rofi dmenu interface to let the user select a clipboard item.
-     * @note This function blocks the caller thread until the user makes a selection or presses ESC.
      */
     void ShowRofiMenu(void) {
         xEntry1("ShowRofiMenu");
@@ -1037,7 +1036,7 @@ RetType ClipboardCaptureInitialize(void) {
             return;
         }
 
-        /// 2. Dump the current RAM list into the text file with PREVIEW and ICON tags
+        /// 2. Dump the current RAM list into the text file
         int size = XCBList_GetItemSize();
         for (int i = 0; i < size; i++) {
             sClipboardItem item;
@@ -1045,11 +1044,14 @@ RetType ClipboardCaptureInitialize(void) {
                 WriteRofiMenuItem(tmp, i, &item);
             }
         }
+
+        /// [NEW OPTION]: Append "Clear All History" at the end of the list
+        /// We use the index equal to 'size' as a special signal
+        fprintf(tmp, "%d: --- CLEAR ALL HISTORY ---%cicon\x1f" "edit-clear-all\n", size, '\0');
+
         fclose(tmp);
 
-        /// 3. Execute Rofi and capture its output
-        /// popen() spawns a child process, executes the Rofi command, and creates a pipe 
-        /// so we can read the user's selection from standard output.
+        /// 3. Execute Rofi
         static char RofiCmd[512]; 
         snprintf(RofiCmd, sizeof(RofiCmd), "rofi -dmenu -i -show-icons -p 'X11 Clipboard' < %s", PATH_FILE_ROFI_MENU);
         FILE *rofi = popen(RofiCmd, "r");
@@ -1060,20 +1062,22 @@ RetType ClipboardCaptureInitialize(void) {
         }
 
         char result[256];
-        
-        /// 4. fgets will block and wait until the user selects an item or presses ESC
         if (fgets(result, sizeof(result), rofi) != NULL) {
-            
-            /// 5. Parse the selected index from the returned string. 
-            /// Since our format is "Index: Preview Text", we can safely extract the integer.
             int selected_index = -1;
             if (sscanf(result, "%d:", &selected_index) == 1) {
-                xLog1("[UI] User selected index: %d", selected_index);
                 
-                /// 6. Set the logical index and trigger the X11 injection flag.
-                /// The XClipboardRuntime thread will pick up this flag and handle the injection.
-                if (XCBList_SetSelectedNum(selected_index) == OKE) {
-                    ReqTestInject = eACTIVATE;
+                /// 4. Logic Handling based on index
+                if (selected_index == size) {
+                    /// User selected "CLEAR ALL HISTORY"
+                    xLog1("[UI] User requested to CLEAR ALL HISTORY.");
+                    XCBList_ClearAllItems();
+                } 
+                else {
+                    /// User selected a normal item
+                    xLog1("[UI] User selected index: %d", selected_index);
+                    if (XCBList_SetSelectedNum(selected_index) == OKE) {
+                        ReqTestInject = eACTIVATE;
+                    }
                 }
             }
         } else {
