@@ -944,7 +944,7 @@ void* XClipboardRuntime_Provider(void* Param){
             }
         }
     }
-    
+        
     xExit1("XClipboardRuntime_Provider");
     return NULL;
 }
@@ -1218,4 +1218,9 @@ RetType ClipboardCaptureInitialize(void) {
         xExit1("ShowRofiMenu");
     }
 
-#endif /*(ROFI_SUPPORT == 1)*/
+#endif /*(ROFI_SUPPORT == 1)*/ 
+
+/**************************************************************************************************
+ * EOF ********************************************************************************************
+ **************************************************************************************************/
+
