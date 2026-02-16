@@ -2,6 +2,18 @@
 #include "CBC_Setup.h"
 #include "CBC_SysFile.h"
 #include "xUniversal.h"
+#include <xUniversalReturn.h>
+#include <xcb/xcb.h>
+#include <sys/time.h>
+#include <semaphore.h>
+
+/**************************************************************************************************
+ * FORWARD DECLARATIONS ***************************************************************************
+ **************************************************************************************************/ 
+void HandleSelectionNotify(xcb_generic_event_t *Event);
+void HandleSelectionRequest(xcb_generic_event_t *Event);
+void HandlePropertyNotify(xcb_generic_event_t *Event);
+void HandleXFixesNotify(xcb_generic_event_t *Event);
 
 /**************************************************************************************************
  * X11 ATOMS SECTION ******************************************************************************
@@ -31,6 +43,11 @@ xcb_atom_t AtomPng;
  * @brief Atom representing JPEG image MIME type ("image/jpeg").
  */
 xcb_atom_t AtomJpeg;
+
+/**
+ * @brief Atom representing BMP image MIME type ("image/bmp").
+ */
+xcb_atom_t AtomBmp;
 
 /**
  * @brief Custom property Atom used as a temporary buffer for selection transfers.
@@ -85,89 +102,226 @@ xcb_connection_t *Connection = NULL;
  **************************************************************************************************/ 
 
 /**
- * @brief Flag to trigger the UI popup menu (eREQ_SHOW, eREQ_HIDE, or eNOT_STARTED).
- * @note This variable is modified asynchronously by the OS signal handler.
+ * @brief Flag to control the visibility state of the UI popup menu (e.g., Rofi).
+ * @note Modified asynchronously by the OS signal handler.
  */
 volatile sig_atomic_t TogglePopUpStatus = eNOT_STARTED;
 
 /**
- * @brief Flag to signal all threads to gracefully exit.
- * @note Set to eACTIVATE upon receiving SIGINT or SIGTERM.
+ * @brief Global flag to signal all threads to gracefully terminate.
  */
-volatile sig_atomic_t RequestExit = eDEACTIVATE;
+volatile sig_atomic_t RequestExit       = eDEACTIVATE;
 
 /**
  * @brief Flag to trigger the injection of the selected clipboard item into the active window.
  */
-volatile sig_atomic_t ReqTestInject = eDEACTIVATE;
+volatile sig_atomic_t ReqTestInject     = eDEACTIVATE;
 
 /**
- * @brief Thread handle for the OS signal listener (SIGUSR1, SIGINT).
+ * @brief Synchronization flag used to block the Provider thread until the Receiver thread finishes X11 setup.
+ */
+volatile sig_atomic_t ReqWaitForSetup   = eACTIVATE;      
+
+/**
+ * @brief POSIX Semaphore used to block and wake up the Provider thread without consuming CPU cycles.
+ */
+static sem_t SemProviderWakeup;
+
+/**
+ * @brief Thread handle for the OS signal listener (SIGINT, SIGUSR1, SIGUSR2).
  */
 static pthread_t SignalRuntimeThread;
 
 /**
- * @brief Thread handle for the main X11 event loop and clipboard logic.
+ * @brief Thread handle for the X11 event loop that continuously receives clipboard data.
  */
-static pthread_t XClipboardRuntimeThread;
+static pthread_t XClipboardRuntimeThread_Receiver;
+
+/**
+ * @brief Thread handle for the background loop that serves clipboard data to other applications.
+ */
+static pthread_t XClipboardRuntimeThread_Provider;
+
 
 /**************************************************************************************************
  * INCR PROTOCOL (PROVIDER) SECTION ***************************************************************
  **************************************************************************************************/ 
 
 /**
- * @brief Maximum chunk size (64KB) for INCR protocol transfers.
+ * @brief Maximum chunk size (64KB) for sending data via the INCR protocol.
  */
 #define INCR_CHUNK_SIZE 65536
 
 /**
- * @brief Pointer to the data currently being transmitted via INCR protocol.
+ * @brief Pointer to the payload currently being transmitted to another application.
  */
 uint8_t *IncrData = NULL;
 
 /**
- * @brief Total size of the data being transmitted via INCR protocol.
+ * @brief Total size in bytes of the payload being transmitted.
  */
 size_t IncrDataLen = 0;
 
 /**
- * @brief Current byte offset of the INCR transmission.
+ * @brief Current byte offset indicating how much data has been successfully transmitted.
  */
 size_t IncrOffset = 0;
 
 /**
- * @brief The window ID of the application requesting the INCR transfer.
+ * @brief The X11 Window ID of the application requesting the clipboard data.
  */
 xcb_window_t IncrRequestor = XCB_NONE;
 
 /**
- * @brief The property atom used for the current INCR transfer.
+ * @brief The X11 Atom representing the property used to stage outgoing chunks.
  */
 xcb_atom_t IncrProperty = XCB_NONE;
 
 /**
- * @brief The target format atom of the current INCR transfer.
+ * @brief The X11 Atom representing the requested data format (e.g., UTF8_STRING, image/png).
  */
 xcb_atom_t IncrTarget = XCB_NONE;
 
+
 /**************************************************************************************************
- * INCR PROTOCOL (RECEIVER) SECTION ***************************************************************
+ * FULL-TRANSACTION LOCK & 128MB RAM CACHING (RECEIVER) SECTION ***********************************
  **************************************************************************************************/ 
 
 /**
- * @brief Flag indicating if the application is currently receiving an INCR transfer.
+ * @brief Maximum size of the RAM cache buffer (128MB).
  */
-int IsReceivingIncr = 0;
+#define MAX_RAM_CACHE (128U * 1024U * 1024U)
 
 /**
- * @brief File pointer used to append incoming INCR chunks to disk.
+ * @brief Safety timeout in milliseconds to automatically break a stuck transaction.
  */
-FILE *IncrRecvFile = NULL;
+#define TRANSACTION_TIMEOUT_MS 5000          
 
 /**
- * @brief Filename of the current INCR transfer being received.
+ * @brief Global lock flag to prevent interleaved or spamming transactions (0 = free, 1 = busy).
+ */
+volatile sig_atomic_t TransactionLock = 0;   
+
+/**
+ * @brief Flag indicating whether the Receiver is currently processing an incoming INCR stream.
+ */
+static int IsReceivingIncr = 0;              
+
+/**
+ * @brief Timestamp of the current X11 transaction used to prevent race conditions.
+ */
+static xcb_timestamp_t CurrentTransactionTime = XCB_CURRENT_TIME;
+
+/**
+ * @brief Heartbeat timestamp (in milliseconds) used to track transaction timeouts.
+ */
+static long long TransactionStartMs = 0;     
+
+/**
+ * @brief Pointer to the statically allocated 128MB RAM buffer for fast data ingestion.
+ */
+static uint8_t *IncrRecvBuf = NULL;          
+
+/**
+ * @brief Current write offset within the 128MB RAM cache.
+ */
+static size_t IncrRecvOffset = 0;          
+
+/**
+ * @brief Cumulative count of bytes received across all chunks and disk flushes.
+ */
+static size_t TotalBytesReceived = 0;      
+
+/**
+ * @brief File handle used to flush the RAM cache to disk when full or finished.
+ */
+FILE *IncrRecvFile = NULL;                   
+
+/**
+ * @brief The generated filename for the current incoming clipboard item.
  */
 char IncrRecvFilename[NAME_MAX];
+
+/**************************************************************************************************
+ * HELPER FUNCTIONS *******************************************************************************
+ **************************************************************************************************/ 
+
+/**
+ * @brief Returns current time in milliseconds.
+ */
+static inline long long GetNowMs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/**
+ * @brief Generates a unique filename using timestamp and a static counter.
+ */
+static inline void GetUniqueFilename(char *buf, size_t len, const char *ext) {
+    static int FileCounter = 0;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm *tm_info = localtime(&tv.tv_sec);
+
+    snprintf(buf, len, "%04d%02d%02d_%02d%02d%02d_%03ld_%d.%s",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
+             tv.tv_usec / 1000, FileCounter++, ext);
+    if (FileCounter > 999) FileCounter = 0;
+}
+
+/**
+ * @brief Pushes incoming data to the 128MB RAM Cache. Flushes to disk if full.
+ * @param data The incoming byte payload.
+ * @param len The length of the payload.
+ */
+static inline void PushToCache(const uint8_t *data, size_t len) {
+    size_t Written = 0;
+    while (Written < len) {
+        size_t SpaceLeft = MAX_RAM_CACHE - IncrRecvOffset;
+        size_t ToWrite = (len - Written < SpaceLeft) ? (len - Written) : SpaceLeft;
+        
+        memcpy(IncrRecvBuf + IncrRecvOffset, data + Written, ToWrite);
+        IncrRecvOffset += ToWrite;
+        Written += ToWrite;
+        TotalBytesReceived += ToWrite;
+
+        /// RAM is full (128MB reached) -> Flush to Disk to free up space
+        if (IncrRecvOffset == MAX_RAM_CACHE) {
+            if (IncrRecvFile) {
+                xLog1("[RAM CACHE] 128MB Full! Flushing to disk...");
+                fwrite(IncrRecvBuf, 1, MAX_RAM_CACHE, IncrRecvFile);
+                fflush(IncrRecvFile);
+            }
+            IncrRecvOffset = 0; /// Reset RAM pointer
+        }
+    }
+}
+
+/**
+ * @brief Finalizes the transaction, flushes remaining RAM to disk, and unlocks the fortress.
+ */
+static inline void FinalizeTransactionAndUnlock(void) {
+    if (IncrRecvFile) {
+        if (IncrRecvOffset > 0) {
+            xLog1("[RAM CACHE] Flushing remaining %zu bytes to disk.", IncrRecvOffset);
+            fwrite(IncrRecvBuf, 1, IncrRecvOffset, IncrRecvFile);
+            fflush(IncrRecvFile);
+        }
+        fclose(IncrRecvFile);
+        IncrRecvFile = NULL;
+        XCBList_PushItem(IncrRecvFilename);
+    }
+    
+    /// Reset States
+    IncrRecvOffset = 0;
+    TotalBytesReceived = 0;
+    IsReceivingIncr = 0;
+    TransactionLock = 0; /// UNLOCK THE FORTRESS
+    
+    xLog1("[FORTRESS] Transaction finalized and unlocked.");
+}
 
 /**************************************************************************************************
  * X11 SERVER SETUP SECTION ***********************************************************************
@@ -175,16 +329,10 @@ char IncrRecvFilename[NAME_MAX];
 
 /**
  * @brief Interns a single X11 atom by its string name.
- * @param c The XCB connection.
- * @param name The string name of the atom.
- * @return The XCB atom ID, or XCB_ATOM_NONE on failure.
  */
 xcb_atom_t GetAtomByName(xcb_connection_t *c, const char *name) {
     xEntry1("GetAtomByName(name=%s)", name);
     
-    /// xcb_intern_atom sends a request to the X Server to get or create a unique integer ID 
-    /// for the given string. This is crucial because X11 components communicate using these IDs 
-    /// (Atoms) instead of passing long strings around to save bandwidth.
     xcb_intern_atom_cookie_t ck = xcb_intern_atom(c, 0, strlen(name), name);
     xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(c, ck, NULL);
     
@@ -201,53 +349,44 @@ xcb_atom_t GetAtomByName(xcb_connection_t *c, const char *name) {
 
 /**
  * @brief Ensures that only one instance of xClipBoardCapture is running.
- * @return OKE if this is the first instance, ERR otherwise.
  */
 RetType CheckSingleInstance(xcb_connection_t *c, xcb_window_t win) {
-    /// 1. Intern a unique Atom name for our application lock
     xcb_atom_t LockAtom = GetAtomByName(c, "CLIPBOARD_CAPTURE_SINGLE_INSTANCE_LOCK");
 
-    /// 2. Query the X Server: "Who is the current owner of this lock?"
     xcb_get_selection_owner_cookie_t cookie = xcb_get_selection_owner(c, LockAtom);
-    xcb_get_selection_owner_reply_t *reply = xcb_get_selection_owner_reply(c, cookie, NULL);
+    xcb_get_selection_owner_reply_t *r = xcb_get_selection_owner_reply(c, cookie, NULL);
 
-    if (reply && reply->owner != XCB_NONE) {
-        /// If the owner is NOT NONE, it means another process (App 1) is already holding it.
-        free(reply);
+    if (r && r->owner != XCB_NONE) {
+        free(r);
         return ERR; 
     }
-    if (reply) free(reply);
+    if (r) free(r);
 
-    /// 3. If we reached here, no one owns it. Now, we claim it!
     xcb_set_selection_owner(c, win, LockAtom, XCB_CURRENT_TIME);
     
-    /// Double check to be sure we are the real owner
     cookie = xcb_get_selection_owner(c, LockAtom);
-    reply = xcb_get_selection_owner_reply(c, cookie, NULL);
-    if (reply && reply->owner == win) {
-        free(reply);
+    r = xcb_get_selection_owner_reply(c, cookie, NULL);
+    if (r && r->owner == win) {
+        free(r);
         return OKE;
     }
 
-    if (reply) free(reply);
+    if (r) free(r);
     return ERR;
 }
 
 /**
  * @brief Initializes all global atoms used by the application.
- * @param c The XCB connection.
- * @note Must be called before initiating any clipboard transactions.
  */
 void InitAtoms(xcb_connection_t *c) {
     xEntry1("InitAtoms");
     
-    /// Cache all necessary Atoms at startup to avoid synchronous round-trips 
-    /// to the X Server during time-critical clipboard operations.
     AtomClipboard = GetAtomByName(c, "CLIPBOARD");
     AtomUtf8      = GetAtomByName(c, "UTF8_STRING");
     AtomTarget    = GetAtomByName(c, "TARGETS");
     AtomPng       = GetAtomByName(c, "image/png");
     AtomJpeg      = GetAtomByName(c, "image/jpeg");
+    AtomBmp       = GetAtomByName(c, "image/bmp");
     AtomProperty  = GetAtomByName(c, PROP_NAME);
     AtomTimestamp = GetAtomByName(c, "TIMESTAMP"); 
     AtomIncr      = GetAtomByName(c, "INCR");
@@ -257,26 +396,19 @@ void InitAtoms(xcb_connection_t *c) {
 
 /**
  * @brief Creates a hidden dummy window to receive XFixes events.
- * @param c The XCB connection.
- * @return The generated window ID.
  */
 xcb_window_t CreateListenerWindow(xcb_connection_t *c) {
     xEntry1("CreateListenerWindow");
     
-    /// Get the primary screen (root window) where everything is drawn.
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
     xcb_window_t win = xcb_generate_id(c);
     
-    /// Create an unmapped (invisible) window. We don't map it to the screen 
-    /// because it's only used as a communication endpoint for X11 events.
     xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
                       0, 0, 1, 1, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT,
                       screen->root_visual,
                       0, NULL);
 
-    /// Tell the X Server that this window wants to be notified when properties change.
-    /// This is strictly required for the INCR protocol (both sending and receiving chunks).
     uint32_t event_mask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
     xcb_change_window_attributes(c, win, XCB_CW_EVENT_MASK, event_mask);
 
@@ -286,19 +418,14 @@ xcb_window_t CreateListenerWindow(xcb_connection_t *c) {
 
 /**
  * @brief Requests the XFixes extension to notify us of clipboard ownership changes.
- * @param c The XCB connection.
- * @param window The dummy window to receive events.
  */
 void SubscribeClipboardEvents(xcb_connection_t *c, xcb_window_t window) {
     xEntry1("SubscribeClipboardEvents");
     
-    /// Query XFixes version to ensure the server supports it and initialize the extension.
     xcb_xfixes_query_version_cookie_t ck = xcb_xfixes_query_version(c, XCB_XFIXES_MAJOR_VERSION, XCB_XFIXES_MINOR_VERSION);
     xcb_xfixes_query_version_reply_t *r = xcb_xfixes_query_version_reply(c, ck, NULL);
     if(r) free(r);
 
-    /// Subscribe to selection events. The X Server will now send an event to our dummy window
-    /// every time an application calls xcb_set_selection_owner (i.e., when a user copies something).
     uint32_t mask = XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
                     XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
                     XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE;
@@ -313,44 +440,49 @@ void SubscribeClipboardEvents(xcb_connection_t *c, xcb_window_t window) {
  * CLIPBOARD PROVIDER SECTION *********************************************************************
  **************************************************************************************************/ 
 
-/**
- * @brief Loads data into memory and claims ownership of the X11 Clipboard.
- * @param c The XCB connection.
- * @param win Our listener window ID.
- * @param data Pointer to the actual data (text string or image bytes).
- * @param len Length of the data in bytes.
- * @param type The format of the data (AtomUtf8, AtomPng, etc.).
- * @note Frees any previously held active data to prevent memory leaks.
- */
 void SetClipboardData(xcb_connection_t *c, xcb_window_t win, void *data, size_t len, xcb_atom_t type) {
     xEntry1("SetClipboardData");
     
-    /// Free previously cached data to avoid memory leaks before taking new data.
+    long long Now = GetNowMs();
+    if (TransactionLock) {
+        if (Now - TransactionStartMs < TRANSACTION_TIMEOUT_MS) {
+            xWarn("[SetClipboardData] TransactionLock active; discarding SetClipboardData request.");
+            return;
+        } else {
+            xWarn("[SetClipboardData] TransactionLock timed out; forcing reset and accepting new data.");
+            TransactionLock = 0;
+            IncrRequestor = XCB_NONE;
+            IncrProperty  = XCB_NONE;
+            IncrTarget    = XCB_NONE;
+            IncrOffset    = 0;
+            IncrData      = NULL;
+            IncrDataLen   = 0;
+        }
+    }
+
     if (ActiveData) {
         free(ActiveData);
     }
     
-    /// Allocate fresh memory and copy the payload. This acts as our holding buffer.
     ActiveData = malloc(len);
     if (!ActiveData) {
         xError("[SetClipboardData] Out of memory!");
+        ActiveData = NULL;
+        ActiveDataLen = 0;
+        ActiveDataType = 0;
         return;
     }
     memcpy(ActiveData, data, len);
     ActiveDataLen = len;
     ActiveDataType = type;
 
-    /// Announce to the X Server that our window is now the definitive owner of the CLIPBOARD.
-    /// Other applications will now route their paste requests to us.
     xcb_set_selection_owner(c, win, AtomClipboard, XCB_CURRENT_TIME);
     
-    /// Verify that the X Server acknowledged our claim. Another app might have 
-    /// snatched it at the exact same millisecond (race condition).
     xcb_get_selection_owner_cookie_t ck = xcb_get_selection_owner(c, AtomClipboard);
     xcb_get_selection_owner_reply_t *r = xcb_get_selection_owner_reply(c, ck, NULL);
     
     if (r && r->owner == win) {
-        xLog1("[SetClipboardData] Successfully claimed Clipboard ownership! Ready to serve.");
+        xLog1("[SetClipboardData] Successfully claimed Clipboard ownership!");
     } else {
         xError("[SetClipboardData] Failed to claim ownership.");
     }
@@ -365,22 +497,14 @@ void SetClipboardData(xcb_connection_t *c, xcb_window_t win, void *data, size_t 
  * SIGNAL HANDLER SECTION *************************************************************************
  **************************************************************************************************/ 
 
-/**
- * @brief Asynchronous handler called directly by the Linux Kernel when a signal arrives.
- * @param SigNum The ID of the received POSIX signal (e.g., SIGINT, SIGUSR1).
- * @note Avoid using non-reentrant functions (like printf or malloc) inside this handler.
- */
 void SignalEventHandler(int SigNum) {
     xLog1("[SignalEventHandler] Was called with SigNum=%d", SigNum);
 
     if (SigNum == SIGINT || SigNum == SIGTERM) {
-        /// User pressed Ctrl+C or sent a termination kill command.
-        /// Raise the exit flag so the main loop can terminate gracefully.
         RequestExit = eACTIVATE;
         xLog1("[SignalEventHandler] Activate RequestExit!");
     } 
     else if (SigNum == SIGUSR1) {
-        /// Toggle the Rofi menu visibility state.
         if (TogglePopUpStatus == eHIDEN || TogglePopUpStatus == eNOT_STARTED) {
             TogglePopUpStatus = eREQ_SHOW;
         } 
@@ -389,21 +513,15 @@ void SignalEventHandler(int SigNum) {
         }
     }
     else if (SigNum == SIGUSR2) {
-        /// Custom signal received from another terminal (e.g., pkill -SIGUSR2)
-        /// Triggers the background thread to inject the currently selected UI item.
         xLog1("[SignalEventHandler] Injecting selected item into X11 Clipboard...");
         ReqTestInject = eACTIVATE;
+        sem_post(&SemProviderWakeup);
     }
 }
 
-/**
- * @brief Registers the application's signal handlers with the Operating System.
- * @return OKE on success.
- */
 RetType RegisterSignal(void) {
     xEntry1("RegisterSignal");
 
-    /// Map specific POSIX signals to our custom callback function.
     signal(SIGUSR2, SignalEventHandler); 
     signal(SIGUSR1, SignalEventHandler); 
     signal(SIGINT,  SignalEventHandler); 
@@ -415,23 +533,15 @@ RetType RegisterSignal(void) {
     return OKE; 
 }
 
-/**
- * @brief The main loop for the Signal Thread. It idles and waits for OS signals.
- * @param Param Optional parameter passed when the thread starts.
- * @return OKE when the thread exits cleanly.
- */
 RetType SignalRuntime(int Param) {
+    (void)Param;
     xEntry1("SignalRuntime");
 
     RegisterSignal();
 
-    /// Infinite loop to keep this thread alive.
-    /// The pause() function suspends the thread entirely (consuming 0% CPU)
-    /// until a signal is caught and handled by SignalEventHandler.
     while (1) {
         pause(); 
 
-        /// Check flags updated by the asynchronous handler.
         if (RequestExit != 0) {
             xLog1("[SignalRuntime] Exit flag detected. Stopping signal thread...");
             break;
@@ -450,273 +560,266 @@ RetType SignalRuntime(int Param) {
 }
 
 /**************************************************************************************************
- * CLIPBOARD EVENT HANDLERS IMPLEMENTATION ********************************************************
+ * CLIPBOARD EVENT HANDLERS IMPLEMENTATION (FULL-TRANSACTION FORTRESS) ****************************
  **************************************************************************************************/
 
 /**
- * @brief Handles XFixes Selection Notify events (Triggered when another app copies data).
- * @param Event The generic XCB event containing the notification.
+ * @brief Handle XFixes selection notify when another app claims the clipboard.
  */
 void HandleXFixesNotify(xcb_generic_event_t *Event) {
     xcb_xfixes_selection_notify_event_t *Sevent = (xcb_xfixes_selection_notify_event_t *)Event;
+    if (Sevent->owner == MyWindow) return;
+
+    long long Now = GetNowMs();
+
+    /// [FORTRESS LOCK]: Ignore spamming if we are busy handling an active transaction
+    if (TransactionLock) {
+        if (Now - TransactionStartMs < TRANSACTION_TIMEOUT_MS) {
+            xLog1("[XFixes] FORTRESS LOCK: Discarding new owner %u.", Sevent->owner);
+            return;
+        } else {
+            xWarn("[XFixes] TIMEOUT: Previous transaction stuck. Breaking lock.");
+            if (IncrRecvFile) { fclose(IncrRecvFile); IncrRecvFile = NULL; }
+            IncrRecvOffset = 0;
+            TotalBytesReceived = 0;
+            IsReceivingIncr = 0;
+            TransactionLock = 0;
+        }
+    }
+
+    xLog1("[XFixes] New Owner %u. Locking transaction and cleaning property...", Sevent->owner);
     
-    /// Avoid processing events triggered by our own application claiming the clipboard.
-    if (Sevent->owner == MyWindow) {
-        return;
-    }
+    TransactionLock = 1; 
+    TransactionStartMs = Now;
+    CurrentTransactionTime = Sevent->timestamp;
 
-    xLog1("[XClipboardRuntime] [Event] Clipboard Owner Changed! OwnerID: %u", Sevent->owner);
-
-    /// Step 1 of Copying: We don't grab the data blindly. We ask the new owner
-    /// to provide a list of all formats (TARGETS) they can convert their data into.
-    xcb_convert_selection(Connection, MyWindow, AtomClipboard, AtomTarget, AtomProperty, Sevent->timestamp);
-    xcb_flush(Connection);
-}
-
-/**
- * @brief Helper function to handle TARGETS negotiation responses.
- * @param Nevent The selection notify event.
- * @param Data Pointer to the array of supported atoms.
- * @param ByteLen Length of the target data in bytes.
- */
-static inline void HandleSelectionNotify_Negotiate(xcb_selection_notify_event_t *Nevent, void *Data, int ByteLen) {
-    xLog1("[XClipboardRuntime] [Target Negotiation] Received format menu. Length: %d bytes", ByteLen);
-    
-    xcb_atom_t *SupportedAtoms = (xcb_atom_t *)Data;
-    int AtomCount = ByteLen / sizeof(xcb_atom_t);
-    xcb_atom_t BestTarget = XCB_ATOM_NONE;
-
-    /// Scan the provided list of supported formats. 
-    /// We prioritize rich media (PNG) over low-quality media (JPEG), and fallback to text (UTF8).
-    for (int i = 0; i < AtomCount; i++) {
-        if (SupportedAtoms[i] == AtomPng) { BestTarget = AtomPng; break; }
-        else if (SupportedAtoms[i] == AtomJpeg && BestTarget != AtomPng) { BestTarget = AtomJpeg; }
-        else if (SupportedAtoms[i] == AtomUtf8 && BestTarget == XCB_ATOM_NONE) { BestTarget = AtomUtf8; }
-    }
-
-    /// If the owner supports a format we understand, issue a new request for the actual data.
-    if (BestTarget != XCB_ATOM_NONE) {
-        xLog1("[XClipboardRuntime] [Target Negotiation] Found matching target: %u. Requesting data...", BestTarget);
-        xcb_convert_selection(Connection, MyWindow, AtomClipboard, BestTarget, AtomProperty, Nevent->time);
-        xcb_flush(Connection);
-    }
-
-    /// Cleanup the property used for the TARGETS menu.
     xcb_delete_property(Connection, MyWindow, AtomProperty);
     xcb_flush(Connection);
+
+    xcb_convert_selection(Connection, MyWindow, AtomClipboard, AtomTarget, AtomProperty, CurrentTransactionTime);
+    xcb_flush(Connection);
 }
 
 /**
- * @brief Helper function to handle actual data receiving (Single-shot or INCR setup).
- * @param Nevent The selection notify event.
- * @param reply The property reply containing the data chunk or INCR atom.
- * @param Data Pointer to the received payload.
- * @param ByteLen Length of the received payload.
+ * @brief Handle format negotiation and select the best media type.
+ */
+static inline void HandleSelectionNotify_Negotiate(xcb_selection_notify_event_t *Nevent, void *Data, int ByteLen) {
+    xcb_atom_t *Atoms = (xcb_atom_t *)Data;
+    int Count = ByteLen / sizeof(xcb_atom_t);
+    xcb_atom_t Target = XCB_ATOM_NONE;
+
+    for (int i = 0; i < Count; i++) {
+        if (Atoms[i] == AtomPng) { Target = AtomPng; break; }
+        if (Atoms[i] == AtomJpeg) { Target = AtomJpeg; break; }
+        if (Atoms[i] == AtomBmp) { Target = AtomBmp; break; }
+        if (Atoms[i] == AtomUtf8 && Target == XCB_ATOM_NONE) Target = AtomUtf8;
+    }
+
+    if (Target != XCB_ATOM_NONE) {
+        xLog1("[Negotiate] Chosen Target: %u. Requesting data...", Target);
+        
+        TransactionStartMs = GetNowMs(); /// Update heartbeat
+        
+        xcb_delete_property(Connection, MyWindow, AtomProperty);
+        xcb_flush(Connection);
+        
+        xcb_convert_selection(Connection, MyWindow, AtomClipboard, Target, AtomProperty, CurrentTransactionTime);
+        xcb_flush(Connection);
+    } else {
+        xWarn("[Negotiate] No supported target found. Unlocking.");
+        FinalizeTransactionAndUnlock();
+    }
+}
+
+/**
+ * @brief Handles the initial response. Sets up the INCR RAM cache or saves Single-shot data.
  */
 static inline void HandleSelectionNotify_ReceiveAndSave(xcb_selection_notify_event_t *Nevent, xcb_get_property_reply_t *reply, void *Data, int ByteLen) {
-    const char *Extension = "txt"; 
-    if (Nevent->target == AtomPng) Extension = "png";
-    else if (Nevent->target == AtomJpeg) Extension = "jpg";
-
-    /// --- 1. Handle Large Files via INCR Protocol ---
-    /// The sender refused to send everything at once and returned the INCR atom instead.
-    if (reply->type == AtomIncr) {
-        xLog1("[XClipboardRuntime] Sender initiated INCR Protocol. Preparing to receive chunks...");
-        
-        GetTimeBasedFilename(IncrRecvFilename, sizeof(IncrRecvFilename), Extension);
-        char FullPath[PATH_MAX];
-        snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, IncrRecvFilename);
-        
-        /// Open the target file in append/binary mode to stitch incoming chunks together.
-        IncrRecvFile = fopen(FullPath, "wb");
-        if (IncrRecvFile) {
-            IsReceivingIncr = 1;
-            /// Critical step in INCR protocol: We must delete the property to tell the
-            /// sender that we are ready to receive the very first data chunk.
-            xcb_delete_property(Connection, MyWindow, AtomProperty);
-            xcb_flush(Connection);
-        } else {
-            xError("[XRuntime] Failed to open INCR receive file.");
-        }
-    }
-
-    /// --- 2. Handle Single-shot Transfer (With Chunking Fix for Browser limitations) ---
-    /// The sender put the data directly into the property.
-    else {
-        char Filename[NAME_MAX], FullPath[PATH_MAX];
-        GetTimeBasedFilename(Filename, sizeof(Filename), Extension);
-        
-        snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, Filename);
-        FILE *fp = fopen(FullPath, "wb"); 
-        
-        if (fp) {
-            /// Write the initial payload chunk to disk.
-            fwrite(Data, 1, ByteLen, fp);
-            int TotalBytes = ByteLen;
-            
-            /// Web browsers often dump massive amounts of data into a single property without using INCR.
-            /// The X Server will truncate this to ~256KB to protect RAM. 
-            /// We check `reply->bytes_after` to see if the server has more data waiting.
-            uint32_t CurrentOffset = ByteLen / 4; 
-            uint32_t BytesAfter = reply->bytes_after;
-
-            /// Loop to vacuum up all remaining data fragments cached on the X Server.
-            while (BytesAfter > 0) {
-                /// Request the next segment (up to 8MB at a time).
-                xcb_get_property_cookie_t ck = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, CurrentOffset, 2097152);
-                xcb_get_property_reply_t *r = xcb_get_property_reply(Connection, ck, NULL);
-                
-                if (!r) break;
-
-                int ChunkLen = xcb_get_property_value_length(r);
-                if (ChunkLen > 0) {
-                    void *ChunkData = xcb_get_property_value(r);
-                    fwrite(ChunkData, 1, ChunkLen, fp);
-                    TotalBytes += ChunkLen;
-                    
-                    /// Shift the offset forward to prepare for the next read operation.
-                    CurrentOffset += ChunkLen / 4; 
-                }
-                
-                BytesAfter = r->bytes_after;
-                free(r);
-            }
-
-            fclose(fp);
-            
-            /// Add the complete file to the internal history list.
-            XCBList_PushItem(Filename);
-            xLog1("[XClipboardRuntime] Saved %d bytes to %s", TotalBytes, Filename);
-            
-            /// Cleanup the property to avoid memory leaks on the X Server.
-            xcb_delete_property(Connection, MyWindow, AtomProperty);
-            xcb_flush(Connection);
-
-        } else {
-            xError("[XClipboardRuntime] Failed to open file for writing: %s", FullPath);
-        }
-    }
-}
-
-/**
- * @brief Handles Selection Notify events (Triggered when requested data arrives).
- * @param Event The generic XCB event containing the payload.
- */
-void HandleSelectionNotify(xcb_generic_event_t *Event) {
-    xcb_selection_notify_event_t *Nevent = (xcb_selection_notify_event_t *)Event;
-
-    /// If property is NONE, the owner rejected our request (unsupported format or timed out).
-    if (Nevent->property == XCB_NONE) {
-        xWarn("[XClipboardRuntime] [Event] Target conversion failed or denied by owner.");
+    const char *Ext = (Nevent->target == AtomPng) ? "png" : (Nevent->target == AtomJpeg) ? "jpg" : (Nevent->target == AtomBmp) ? "bmp" : "txt";
+    
+    GetUniqueFilename(IncrRecvFilename, sizeof(IncrRecvFilename), Ext);
+    char FullPath[PATH_MAX];
+    snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, IncrRecvFilename);
+    
+    if (IncrRecvFile) fclose(IncrRecvFile);
+    IncrRecvFile = fopen(FullPath, "wb");
+    
+    if (!IncrRecvFile) {
+        xError("[Receive] Failed to open file! Unlocking.");
+        FinalizeTransactionAndUnlock();
         return;
     }
 
-    /// Read up to 32MB initially. If it's larger, the loop inside 
-    /// HandleSelectionNotify_ReceiveAndSave will fetch the rest.
-    xcb_get_property_cookie_t cookie = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, 0, 8388608);
-    xcb_get_property_reply_t *reply = xcb_get_property_reply(Connection, cookie, NULL);
+    IncrRecvOffset = 0;
+    TotalBytesReceived = 0;
 
-    if (reply && xcb_get_property_value_length(reply) > 0) {
-        int ByteLen = xcb_get_property_value_length(reply);
-        void *Data = xcb_get_property_value(reply);
+    if (reply->type == AtomIncr) {
+        uint32_t SizeEst = 0;
+        if (ByteLen >= 4) memcpy(&SizeEst, Data, 4);
+        
+        xLog1("[INCR] Started! Est Size: %u bytes. Processing to 128MB RAM Cache...", SizeEst);
+        IsReceivingIncr = 1;
+        TransactionStartMs = GetNowMs(); /// Update heartbeat
 
-        /// Dispatch to specialized handlers based on what we originally asked for.
-        if (Nevent->target == AtomTarget) {
-            HandleSelectionNotify_Negotiate(Nevent, Data, ByteLen);
+        xcb_delete_property(Connection, MyWindow, AtomProperty);
+        xcb_flush(Connection);
+    } 
+    else {
+        xLog1("[Single-shot] Received directly. Pumping to RAM Cache...");
+        
+        PushToCache((uint8_t *)Data, ByteLen);
+        
+        uint32_t BytesAfter = reply->bytes_after;
+        uint32_t WordOffset = (ByteLen + 3) / 4; 
+
+        /// Drain loop if X Server hides data in Single-shot
+        while (BytesAfter > 0) {
+            
+            xcb_get_property_cookie_t ck = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, WordOffset, 262144);
+            xcb_get_property_reply_t *r = xcb_get_property_reply(Connection, ck, NULL);
+            if (!r) break;
+            
+            int nLen = xcb_get_property_value_length(r);
+            if (nLen > 0) {
+                PushToCache(xcb_get_property_value(r), nLen);
+                WordOffset += (nLen + 3) / 4;
+            }
+            BytesAfter = r->bytes_after;
+            free(r);
         }
-        else if (Nevent->target == AtomUtf8 || Nevent->target == AtomPng || Nevent->target == AtomJpeg) {
-            HandleSelectionNotify_ReceiveAndSave(Nevent, reply, Data, ByteLen);
-        }
+        
+        xLog1("[Single-shot] DONE. Final size: %zu bytes.", TotalBytesReceived);
+        
+        xcb_delete_property(Connection, MyWindow, AtomProperty);
+        xcb_flush(Connection);
+        
+        FinalizeTransactionAndUnlock();
     }
-    
-    if (reply) free(reply);
 }
 
 /**
- * @brief Handles Property Notify events for managing both INCR Receiver and Provider flows.
- * @param Event The generic XCB event indicating property modifications.
+ * @brief Handles Property change events (INCR chunk stream).
  */
 void HandlePropertyNotify(xcb_generic_event_t *Event) {
     xcb_property_notify_event_t *PropEv = (xcb_property_notify_event_t *)Event;
     
-    /// --- [RECEIVER MODE] Processing incoming data chunks ---
-    /// We triggered this by deleting the property. The sender has now written a new chunk.
-    if (IsReceivingIncr && PropEv->window == MyWindow && 
-        PropEv->atom == AtomProperty && PropEv->state == XCB_PROPERTY_NEW_VALUE) {
+    /// --- [RECEIVER MODE] ---
+    if (IsReceivingIncr && PropEv->window == MyWindow && PropEv->atom == AtomProperty && PropEv->state == XCB_PROPERTY_NEW_VALUE) {
         
-        xcb_get_property_cookie_t ck = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, 0, 8388608);
+        TransactionStartMs = GetNowMs(); /// Update heartbeat to prevent timeout
+
+        xcb_get_property_cookie_t ck = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, 0, 262144);
         xcb_get_property_reply_t *r = xcb_get_property_reply(Connection, ck, NULL);
         
         if (r) {
             int ChunkLen = xcb_get_property_value_length(r);
+            uint32_t BytesAfter = r->bytes_after;
+
             if (ChunkLen > 0) {
-                /// Write the chunk to our open file.
-                void *ChunkData = xcb_get_property_value(r);
-                if (IncrRecvFile) fwrite(ChunkData, 1, ChunkLen, IncrRecvFile);
-                
-                /// Delete the property again to ping the sender for the next chunk.
+                PushToCache(xcb_get_property_value(r), ChunkLen);
+
+                /// THE DRAIN: Exhaust the current X Server property before deleting it
+                uint32_t WordOffset = (ChunkLen + 3) / 4;
+                while (BytesAfter > 0) {
+                    xcb_get_property_cookie_t nck = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, WordOffset, 262144);
+                    xcb_get_property_reply_t *nr = xcb_get_property_reply(Connection, nck, NULL);
+                    if (!nr) break;
+
+                    int nLen = xcb_get_property_value_length(nr);
+                    if (nLen > 0) {
+                        PushToCache(xcb_get_property_value(nr), nLen);
+                        WordOffset += (nLen + 3) / 4;
+                    }
+                    BytesAfter = nr->bytes_after;
+                    free(nr);
+                }
+
+                /// Signal the sender that we have exhausted the chunk
                 xcb_delete_property(Connection, MyWindow, AtomProperty);
                 xcb_flush(Connection);
-            } else {
-                /// INCR protocol states that a chunk of size 0 means End-Of-File.
-                xLog1("[INCR RECV] Transfer Complete! Saving item to DB.");
-                if (IncrRecvFile) {
-                    fclose(IncrRecvFile);
-                    IncrRecvFile = NULL;
-                }
-                IsReceivingIncr = 0;
-                XCBList_PushItem(IncrRecvFilename);
+            } 
+            else {
+                /// 0-byte chunk means EOF. Close transaction.
+                xLog1("[INCR DONE] Total transferred: %zu bytes. Finalizing...", TotalBytesReceived);
+                xcb_delete_property(Connection, MyWindow, AtomProperty);
+                xcb_flush(Connection);
+                
+                FinalizeTransactionAndUnlock();
             }
             free(r);
         }
         return; 
     }
-
-    /// --- [PROVIDER MODE] Pumping data chunks out ---
-    /// The receiver just deleted the property, signaling us to push the next chunk.
-    if (PropEv->state == XCB_PROPERTY_DELETE && 
-        PropEv->window == IncrRequestor && 
-        PropEv->atom == IncrProperty) {
-        
+    
+    /// --- [PROVIDER MODE] ---
+    if (PropEv->state == XCB_PROPERTY_DELETE && PropEv->window == IncrRequestor && PropEv->atom == IncrProperty) {
         size_t BytesLeft = IncrDataLen - IncrOffset;
-        
         if (BytesLeft > 0) {
-            /// Slice the next 64KB block from our buffer and inject it into the receiver's window.
             size_t ChunkSize = (BytesLeft > INCR_CHUNK_SIZE) ? INCR_CHUNK_SIZE : BytesLeft;
             
-            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, 
-                                IncrProperty, IncrTarget, 8, ChunkSize, 
-                                (uint8_t *)IncrData + IncrOffset);
+            /// @brief xcb_change_property changes a property on a window.
+            /// @param Mode XCB_PROP_MODE_REPLACE overwrites the property.
+            /// @param Format 8 (8-bit elements for binary stream).
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, IncrProperty, IncrTarget, 8, ChunkSize, (uint8_t *)IncrData + IncrOffset);
             IncrOffset += ChunkSize;
         } else {
-            /// If no bytes are left, inject a 0-byte payload to formally signal End-Of-File.
-            uint8_t EOF_Dummy = 0;
-            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, 
-                                IncrProperty, IncrTarget, 8, 0, &EOF_Dummy);
-            xLog1("[INCR] Transfer Complete!");
-            
-            /// Reset the State Machine.
+            uint8_t EOF_D = 0;
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, IncrRequestor, IncrProperty, IncrTarget, 8, 0, &EOF_D);
             IncrRequestor = XCB_NONE;
-            IncrProperty = XCB_NONE;
-            IncrTarget = XCB_NONE;
+            TransactionLock = 0; /// Unlock provider
         }
         xcb_flush(Connection);
     }
 }
 
 /**
+ * @brief Handles Selection Notify events (Triggered when requested data arrives).
+ */
+void HandleSelectionNotify(xcb_generic_event_t *Event) {
+    xcb_selection_notify_event_t *Nevent = (xcb_selection_notify_event_t *)Event;
+
+    if (Nevent->property == XCB_NONE) {
+        xWarn("[SelectionNotify] Conversion REJECTED. Unlocking.");
+        xcb_delete_property(Connection, MyWindow, AtomProperty);
+        xcb_flush(Connection);
+        FinalizeTransactionAndUnlock();
+        return;
+    }
+
+    xcb_get_property_cookie_t cookie = xcb_get_property(Connection, 0, MyWindow, AtomProperty, XCB_GET_PROPERTY_TYPE_ANY, 0, 2097152);
+    xcb_get_property_reply_t *reply = xcb_get_property_reply(Connection, cookie, NULL);
+
+    if (reply) {
+        int ByteLen = xcb_get_property_value_length(reply);
+        void *Data = xcb_get_property_value(reply);
+
+        if (ByteLen > 0) {
+            if (Nevent->target == AtomTarget) {
+                HandleSelectionNotify_Negotiate(Nevent, Data, ByteLen);
+            }
+            else if (Nevent->target == AtomUtf8 || Nevent->target == AtomPng || 
+                     Nevent->target == AtomJpeg || Nevent->target == AtomBmp) {
+                HandleSelectionNotify_ReceiveAndSave(Nevent, reply, Data, ByteLen);
+            }
+        } else {
+            xWarn("[SelectionNotify] Empty property. Unlocking.");
+            xcb_delete_property(Connection, MyWindow, AtomProperty);
+            xcb_flush(Connection);
+            FinalizeTransactionAndUnlock();
+        }
+        free(reply);
+    } else {
+        FinalizeTransactionAndUnlock();
+    }
+}
+
+/**
  * @brief Handles Selection Request events, providing clipboard data to other apps.
- * @param Event The generic XCB event containing the selection request.
  */
 void HandleSelectionRequest(xcb_generic_event_t *Event) {
     xEntry1("HandleSelectionRequest");
     xcb_selection_request_event_t *Req = (xcb_selection_request_event_t *)Event;
     
-    xLog1("[XClipboardRuntime] [Event] SelectionRequest from window: %u for target: %u", 
-          Req->requestor, Req->target);
-
-    /// 1. Initialize the formal response structure.
-    /// By default, we set property to XCB_NONE, which means "Request Denied".
     xcb_selection_notify_event_t Reply;
     memset(&Reply, 0, sizeof(Reply));
     Reply.response_type = XCB_SELECTION_NOTIFY;
@@ -726,83 +829,72 @@ void HandleSelectionRequest(xcb_generic_event_t *Event) {
     Reply.time          = Req->time;
     Reply.property      = XCB_NONE; 
     
-    /// The ICCCM standard dictates that if the requestor provides NONE as the property, 
-    /// we must use their target atom as the property name for the transfer.
     xcb_atom_t ValidProperty = (Req->property == XCB_NONE) ? Req->target : Req->property;
 
-    /// 2. Process the request based on what the other application wants.
-    
     if (Req->target == AtomTarget) { 
-        /// --- 2a. Target Negotiation ---
-        /// They want to know what formats we can provide. We respond with an array
-        /// containing TARGETS, TIMESTAMP, and the actual format of our cached data.
         xcb_atom_t SupportedTargets[] = { AtomTarget, AtomTimestamp, ActiveDataType };
-        int NumTargets = sizeof(SupportedTargets) / sizeof(xcb_atom_t);
-        
-        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
-                            ValidProperty, XCB_ATOM_ATOM, 32, NumTargets, SupportedTargets);
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, ValidProperty, XCB_ATOM_ATOM, 32, 3, SupportedTargets);
         Reply.property = ValidProperty;
     }
     else if (Req->target == AtomTimestamp) {
-        /// --- 2b. Timestamp Request ---
-        /// Used by window managers to resolve race conditions between clipboard clients.
         xcb_timestamp_t CurrentTime = Req->time; 
-        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
-                            ValidProperty, XCB_ATOM_INTEGER, 32, 1, &CurrentTime);
+        xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, ValidProperty, XCB_ATOM_INTEGER, 32, 1, &CurrentTime);
         Reply.property = ValidProperty;
     }
     else if (Req->target == ActiveDataType && ActiveData != NULL) {
-        /// --- 2c. Actual Data Request ---
-        /// They requested the correct format, so we proceed to send the payload.
-        
         if (ActiveDataLen > INCR_CHUNK_SIZE) {
-            
-            /// [FIX DEADLOCK]: If we are stuck serving a previous app that disconnected 
-            /// unexpectedly without finishing INCR, we ruthlessly abort that transfer 
-            /// to serve the new incoming request.
-            if (IncrData != NULL) {
-                xLog1("[INCR] Alert! Aborting stuck transfer to serve new req from Window: %u", Req->requestor);
-                IncrData      = NULL;
-                IncrOffset    = 0;
-                IncrRequestor = XCB_NONE;
+            if (IncrRequestor != XCB_NONE) {
+                xWarn("[HandleSelectionRequest] Provider busy. Rejecting req.");
+                Reply.property = XCB_NONE;
+            } else {
+                IncrData = (uint8_t *)ActiveData; 
+                IncrDataLen = ActiveDataLen; 
+                IncrOffset = 0;
+                IncrRequestor = Req->requestor; 
+                IncrProperty = ValidProperty; 
+                IncrTarget = ActiveDataType;
+
+                uint32_t EventMask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
+                xcb_change_window_attributes(Connection, Req->requestor, XCB_CW_EVENT_MASK, EventMask);
+                uint32_t TotalSize = ActiveDataLen;
+                xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, ValidProperty, AtomIncr, 32, 1, &TotalSize);
+                
+                TransactionLock = 1; /// Lock provider transaction
+                TransactionStartMs = GetNowMs();
+                Reply.property = ValidProperty;
             }
-
-            xLog1("[XRuntime] Data > 64KB. Starting INCR Protocol...");
-
-            /// Initialize the global state machine variables for the INCR process.
-            IncrData      = ActiveData;
-            IncrDataLen   = ActiveDataLen;
-            IncrOffset    = 0;
-            IncrRequestor = Req->requestor;
-            IncrProperty  = ValidProperty;
-            IncrTarget    = ActiveDataType;
-
-            /// We MUST subscribe to PropertyChange events on the target window. 
-            /// Otherwise, we won't hear them delete the property to trigger our next chunk.
-            uint32_t EventMask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
-            xcb_change_window_attributes(Connection, Req->requestor, XCB_CW_EVENT_MASK, EventMask);
-
-            /// Tell the requestor we are starting an INCR transfer. 
-            /// We write a single 32-bit integer indicating the total expected size.
-            uint32_t TotalSize = ActiveDataLen;
-            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
-                                ValidProperty, AtomIncr, 32, 1, &TotalSize);
-            Reply.property = ValidProperty;
-        } 
-        else {
-            /// Payload is small enough to fit inside a single property update.
-            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, 
-                                ValidProperty, ActiveDataType, 8, ActiveDataLen, ActiveData);
+        } else {
+            xcb_change_property(Connection, XCB_PROP_MODE_REPLACE, Req->requestor, ValidProperty, ActiveDataType, 8, ActiveDataLen, ActiveData);
             Reply.property = ValidProperty;
         }
     }
 
-    /// 3. Send the formal XCB_SELECTION_NOTIFY event back to the requestor
-    /// to tell them the property is ready (or denied if Reply.property is NONE).
+    /// @brief xcb_send_event transmits an event directly to a client.
+    /// @param Propagate Mask XCB_EVENT_MASK_NO_EVENT ensures targeted delivery.
     xcb_send_event(Connection, 0, Req->requestor, XCB_EVENT_MASK_NO_EVENT, (const char *)&Reply);
     xcb_flush(Connection);
-    
     xExit1("HandleSelectionRequest");
+}
+
+/**
+ * @brief Sends a dummy client message to unblock xcb_wait_for_event.
+ * @note This is crucial for cleanly shutting down the Receiver thread which
+ * would otherwise remain blocked indefinitely waiting for X11 activity.
+ */
+static inline void WakeUpReceiverThread(void) {
+    if (Connection && MyWindow != XCB_NONE) {
+        xcb_client_message_event_t DummyEvent;
+        memset(&DummyEvent, 0, sizeof(DummyEvent));
+        DummyEvent.response_type = XCB_CLIENT_MESSAGE;
+        DummyEvent.format = 32;
+        DummyEvent.window = MyWindow;
+        DummyEvent.type = AtomTarget; /// Attach an arbitrary valid Atom
+
+        /// @brief xcb_send_event forces the X Server to route an event directly to MyWindow
+        xcb_send_event(Connection, 0, MyWindow, XCB_EVENT_MASK_NO_EVENT, (const char *)&DummyEvent);
+        xcb_flush(Connection);
+        xLog1("[Finalize] Sent Dummy Event to wake up Receiver thread.");
+    }
 }
 
 /**************************************************************************************************
@@ -810,91 +902,96 @@ void HandleSelectionRequest(xcb_generic_event_t *Event) {
  **************************************************************************************************/
 
 /**
- * @brief The main loop that manages X11 connections and dispatches events.
- * @param Param Optional thread parameter.
- * @return OKE when the thread exits cleanly.
+ * @brief Provider Thread: Idles at 0% CPU waiting to inject data into the Clipboard.
  */
-RetType XClipboardRuntime(int Param) {
-    xEntry1("XClipboardRuntime");
+void* XClipboardRuntime_Provider(void* Param){
+    (void)Param;
+    xEntry1("XClipboardRuntime_Provider");
+    
+    /// Wait until the Receiver thread has fully initialized the XCB Connection and Window
+    while(ReqWaitForSetup == eACTIVATE) {
+        usleep(5U * 1000U); 
+    }
+
+    while (RequestExit != eACTIVATE) {
+        /// [BLOCK-WAIT]: Completely suspend this thread, consuming 0% CPU.
+        /// It will wake up when another thread calls sem_post(&SemProviderWakeup).
+        sem_wait(&SemProviderWakeup); 
+        
+        if (RequestExit == eACTIVATE) break;
+
+        if (ReqTestInject == eACTIVATE) {
+            ReqTestInject = eDEACTIVATE;
+            sClipboardItem LatestItem;
+            
+            if (XCBList_GetSelectedItem(&LatestItem) == OKE) {
+                xcb_atom_t TargetAtom = AtomUtf8; 
+                if (LatestItem.FileType == eFMT_IMG_PNG) TargetAtom = AtomPng;
+                else if (LatestItem.FileType == eFMT_IMG_JGP) TargetAtom = AtomJpeg;
+                else if (LatestItem.FileType == eFMT_IMG_BMP) TargetAtom = AtomBmp; 
+
+                static uint8_t RawData[8U * 1024U * 1024U]; 
+                char FullPath[PATH_MAX];
+                snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, LatestItem.Filename);
+                struct stat FileStat;
+                
+                if (stat(FullPath, &FileStat) == 0 && FileStat.st_size > 0 && (size_t)FileStat.st_size <= sizeof(RawData)) {
+                    int SelectedIdx = XCBList_GetSelectedNum();
+                    if (XCBList_ReadAsBinary(SelectedIdx, RawData, sizeof(RawData)) >= 0) {
+                        SetClipboardData(Connection, MyWindow, (void *)RawData, FileStat.st_size, TargetAtom);
+                    }
+                }
+            }
+        }
+    }
+    
+    xExit1("XClipboardRuntime_Provider");
+    return NULL;
+}
+
+/**
+ * @brief Receiver Thread: Blocks continuously to catch events from the X Server.
+ */
+void* XClipboardRuntime_Receiver(void* Param) {
+    (void)Param; 
+    xEntry1("XClipboardRuntime_Receiver");
 
     Connection = xcb_connect(NULL, NULL);
-    if (xcb_connection_has_error(Connection)) return ERR;
+    if (xcb_connection_has_error(Connection)) return NULL;
 
-    /// Retrieve the base event code for XFixes. This is necessary because 
-    /// extension event codes are dynamically assigned by the X Server.
     const xcb_query_extension_reply_t *xfixes_data = xcb_get_extension_data(Connection, &xcb_xfixes_id);
-    if (!xfixes_data || !xfixes_data->present) return ERR;
+    if (!xfixes_data || !xfixes_data->present) return NULL;
     uint8_t XFixesEventBase = xfixes_data->first_event;
 
-    /// Prepare environment variables.
     InitAtoms(Connection);
     MyWindow = CreateListenerWindow(Connection);
     SubscribeClipboardEvents(Connection, MyWindow);
 
     if(CheckSingleInstance(Connection, MyWindow) != OKE){
-        xError("[XClipboardRuntime] Another app already started! Please close it before start again!");
-        ClipboardCaptureFinalize();
+        xError("[XClipboardRuntime] Another app already started!");
         exit(-1);
     }
 
-    xLog1("[XClipboardRuntime] Listening for Clipboard events...");
+    /// Signal the Provider thread that X11 setup is complete
+    ReqWaitForSetup = eDEACTIVATE; 
+    xLog1("[XClipboardRuntime_Receiver] Setup Done. Listening for events...");
+
     xcb_generic_event_t *Event;
 
     while (RequestExit != eACTIVATE) {
         
-        /// Handle manual injection triggered by the Rofi UI menu.
-        if (ReqTestInject == eACTIVATE) {
-            ReqTestInject = eDEACTIVATE;
-            sClipboardItem LatestItem;
-            
-            /// 1. Retrieve the metadata of the user's selected history item.
-            if (XCBList_GetSelectedItem(&LatestItem) == OKE) {
-                
-                /// Resolve the correct X11 MIME type based on the file extension.
-                xcb_atom_t TargetAtom = AtomUtf8; 
-                if (LatestItem.FileType == eFMT_IMG_PNG) TargetAtom = AtomPng;
-                else if (LatestItem.FileType == eFMT_IMG_JGP) TargetAtom = AtomJpeg;
-
-                static uint8_t RawData[8U * 1024U * 1024U]; 
-                
-                char FullPath[PATH_MAX];
-                snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, LatestItem.Filename);
-                struct stat FileStat;
-                
-                /// 2. Verify file integrity and ensure it fits into the 8MB buffer.
-                if (stat(FullPath, &FileStat) == 0 && FileStat.st_size > 0 && FileStat.st_size <= sizeof(RawData)) {
-                    int SelectedIdx = XCBList_GetSelectedNum();
-                    
-                    /// 3. Read the binary data from disk and inject it into the X11 clipboard system.
-                    if (XCBList_ReadAsBinary(SelectedIdx, RawData, sizeof(RawData)) >= 0) {
-                        SetClipboardData(Connection, MyWindow, (void *)RawData, FileStat.st_size, TargetAtom);
-                        xLog1("[XClipboardRuntime] Injected %s (%ld bytes) as Atom %u", 
-                              LatestItem.Filename, FileStat.st_size, TargetAtom);
-                    } else {
-                        xWarn("[XClipboardRuntime] ReadAsBinary failed!");
-                    }
-                } else {
-                    xWarn("[XClipboardRuntime] File missing, empty, or exceeds 8MB buffer!");
-                }
-            } else {
-                xWarn("[XClipboardRuntime] No item selected or DB is empty!");
-            }
-        }
-
-        /// Use xcb_poll_for_event instead of xcb_wait_for_event. This makes the loop non-blocking 
-        /// so we can periodically check the `ReqTestInject` and `RequestExit` flags.
-        Event = xcb_poll_for_event(Connection);
+        /// [BLOCK-WAIT]: Suspend execution here until an Event (or the exit Dummy Event) arrives
+        Event = xcb_wait_for_event(Connection);
         if (Event == NULL) {
-            if (xcb_connection_has_error(Connection)) break;
-            usleep(2U * 1000U); /// Fast polling (2ms) ensures INCR protocol speed remains high.
+            if (xcb_connection_has_error(Connection)) {
+                xError("[XClipboardRuntime_Receiver] Connection has an error!");
+                break;
+            }
             continue;
         }
 
-        /// Strip the highest bit (0x80) from the response type. This bit merely indicates 
-        /// that the event was synthesized by another client (via xcb_send_event).
         uint8_t EventType = Event->response_type & ~0x80;
 
-        /// Dispatch the event to the appropriate specialized handler.
         if (EventType == (XFixesEventBase + XCB_XFIXES_SELECTION_NOTIFY)) {
             HandleXFixesNotify(Event);
         }
@@ -907,84 +1004,76 @@ RetType XClipboardRuntime(int Param) {
         else if (EventType == XCB_PROPERTY_NOTIFY) {
             HandlePropertyNotify(Event);
         }
+        /// Note: Dummy events (XCB_CLIENT_MESSAGE) used for waking up the thread are safely ignored here.
 
         free(Event);
     }
 
     xcb_disconnect(Connection);
-    xExit1("XClipboardRuntime");
-    return OKE;
+    xExit1("XClipboardRuntime_Receiver");
+    return NULL;
 }
 
 /**************************************************************************************************
  * LIFECYCLE SECTION IMPLEMENTATION ***************************************************************
  **************************************************************************************************/ 
 
-/**
- * @brief Cleans up resources and waits for the background threads to exit safely.
- * @note Registered via atexit() to run automatically upon application termination.
- */
 void ClipboardCaptureFinalize(void) {
     xLog1("[Finalize] Initiating shutdown sequence...");
+    
+    /// 1. Raise the exit flag for the entire system
+    RequestExit = eACTIVATE;
 
-    /// Send an interrupt signal to wake up the SignalRuntimeThread if it's stuck in pause().
+    /// 2. Wake up the Signal Thread (if it is suspended in pause())
     int SigKillStatus = pthread_kill(SignalRuntimeThread, SIGINT);
     if (SigKillStatus == 0) {
         pthread_join(SignalRuntimeThread, NULL);
-        xLog1("[Finalize] Signal Thread joined.");
     }
 
-    /// Wait for the X11 thread to finish processing its current event and exit.
-    pthread_join(XClipboardRuntimeThread, NULL);
-    xLog1("[Finalize] XClipboard Thread joined.");
+    /// 3. Wake up the Provider Thread (via Semaphore)
+    sem_post(&SemProviderWakeup);
+    pthread_join(XClipboardRuntimeThread_Provider, NULL);
+    xLog1("[Finalize] Provider Thread joined.");
+
+    /// 4. Wake up the Receiver Thread (via Dummy X11 Event)
+    WakeUpReceiverThread();
+    pthread_join(XClipboardRuntimeThread_Receiver, NULL);
+    xLog1("[Finalize] Receiver Thread joined.");
     
-    /// Free the global active clipboard payload.
     if (ActiveData != NULL) {
         free(ActiveData);
         ActiveData = NULL;
-        ActiveDataLen = 0;
-        xLog1("[Finalize] Freed ActiveData buffer.");
+    }
+    if (IncrRecvBuf) { 
+        free(IncrRecvBuf); 
+        IncrRecvBuf = NULL; 
     }
     
-    xLog1("[Finalize] Application exited gracefully.");
-    xExit1("ClipboardCaptureFinalize");
+    /// Cleanup the Semaphore resource
+    sem_destroy(&SemProviderWakeup);
 }
 
-/**
- * @brief Initializes database directories, starts background threads, and prepares X11 atoms.
- * @return OKE on success, ERR on failure.
- */
 RetType ClipboardCaptureInitialize(void) {
-    xEntry1("ClipboardCaptureInitialize");
-    
-    /// Register the cleanup callback to ensure resources are freed when main() exits.
     atexit(ClipboardCaptureFinalize);
 
-    /// Verify local storage directories.
-    if (EnsureDB() != OKE) {
-        xError("[Initialize] System Check Failed!");
-        return ERR; 
-    }
+    if (EnsureDB() != OKE) return ERR;
+    if (XCBList_Scan(0) < 0) return ERR;
 
-    /// Load existing clipboard items from disk into the Ring Buffer.
-    if(XCBList_Scan(0) < 0){
-        xError("[Initialize] Scan DB failed!");
-    }
+    /// Initialize the Semaphore (pshared = 0, initial_value = 0 to start in a blocking state)
+    sem_init(&SemProviderWakeup, 0, 0);
 
-    /// Spin up the POSIX Signal monitoring thread.
-    if (pthread_create(&SignalRuntimeThread, NULL, (void *(*)(void *))SignalRuntime, NULL) != 0) {
-        xError("[Initialize] Failed to create Signal Thread!");
+    IncrRecvBuf = malloc(MAX_RAM_CACHE);
+    if (!IncrRecvBuf) {
+        xError("[Initialize] FATAL: Out of memory for 128MB RAM Cache!");
         return ERR;
     }
 
-    /// Spin up the X11 event loop thread.
-    if (pthread_create(&XClipboardRuntimeThread, NULL, (void *(*)(void *))XClipboardRuntime, NULL) != 0) {
-        xError("[Initialize] Failed to create XClipboard Thread!");
-        return ERR;
-    }
+    /// Spawn the three independent application threads
+    if (pthread_create(&SignalRuntimeThread, NULL, (void *(*)(void *))SignalRuntime, NULL) != 0) return ERR;
+    if (pthread_create(&XClipboardRuntimeThread_Provider, NULL, (void *(*)(void *))XClipboardRuntime_Provider, NULL) != 0) return ERR;
+    if (pthread_create(&XClipboardRuntimeThread_Receiver, NULL, (void *(*)(void *))XClipboardRuntime_Receiver, NULL) != 0) return ERR;
 
-    xLog1("[Initialize] All systems started. Main thread is now free.");
-    xExit1("ClipboardCaptureInitialize");
+    xLog1("[Initialize] Started. Threads Online. 128MB RAM Cache Online.");
     return OKE;
 }
 
@@ -1117,6 +1206,7 @@ RetType ClipboardCaptureInitialize(void) {
                     xLog1("[UI] User selected index: %d", selected_index);
                     if (XCBList_SetSelectedNum(selected_index) == OKE) {
                         ReqTestInject = eACTIVATE;
+                        sem_post(&SemProviderWakeup);
                     }
                 }
             }
@@ -1129,7 +1219,3 @@ RetType ClipboardCaptureInitialize(void) {
     }
 
 #endif /*(ROFI_SUPPORT == 1)*/
-
-/**************************************************************************************************
- * EOF ********************************************************************************************
- **************************************************************************************************/

@@ -13,8 +13,9 @@
 enum XCBFileType {
     eFMT_NONE = 0, 
     eFMT_TXT, 
+    eFMT_IMG_PNG,
     eFMT_IMG_JGP, 
-    eFMT_IMG_PNG
+    eFMT_IMG_BMP
 };
 
 /**
