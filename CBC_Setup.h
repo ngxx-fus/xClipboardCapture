@@ -2,46 +2,6 @@
 #define __SETUP_H__
 
 /**************************************************************************************************
- * INCLUDE SECTION ********************************************************************************
- **************************************************************************************************/ 
-
-#include <asm-generic/errno-base.h>
-
-/**
- * @note Ensure xUniversalReturn.h defines xEntry, xExit, xLog, xError macros before inclusion.
- */
-#include <xUniversalReturn.h> 
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <time.h>
-#include <stdint.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <signal.h>
-#include <pthread.h>
-
-#include <xcb/xcb.h>
-#include <xcb/xproto.h>
-
-/**
- * @note IMPORTANT: Requires linking with libxcb-xfixes (-lxcb-xfixes).
- */
-#include <xcb/xfixes.h> 
-
-/**
- * @note Requires linking with zlib (-lz) if compression features are used.
- */
-#include <zlib.h> 
-
-#include "xUniversal.h"
-
-/**************************************************************************************************
  * MACRO CONFIGURATIONS SECTION *******************************************************************
  **************************************************************************************************/ 
 
