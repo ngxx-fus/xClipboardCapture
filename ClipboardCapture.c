@@ -1099,6 +1099,10 @@ RetType ClipboardCaptureInitialize(void) {
         char FullPath[PATH_MAX];
         snprintf(FullPath, sizeof(FullPath), "%s/%s", PATH_DIR_DB, Item->Filename);
 
+        if (access(FullPath, F_OK) != 0) {
+            return ERR; 
+        }
+
         if (Item->FileType == eFMT_IMG_PNG || Item->FileType == eFMT_IMG_JGP) {
             /// For images: No preview text, just print "[Image]" and pass the path as Thumbnail
             fprintf(OutFile, "%d: [Image] %s%cicon\x1f%s\n", 
@@ -1143,11 +1147,11 @@ RetType ClipboardCaptureInitialize(void) {
                 fprintf(OutFile, "%d: %s%cicon\x1ftext-x-generic\n", 
                         Index, Preview, '\0');
             } 
-            else {
+            // else {
                 /// Fallback in case the file is missing or deleted
-                fprintf(OutFile, "%d: [Empty/Missing File]%cicon\x1ftext-x-generic\n", 
-                        Index, '\0');
-            }
+                // fprintf(OutFile, "%d: [Empty/Missing File]%cicon\x1ftext-x-generic\n", 
+                        // Index, '\0');
+            // }
         }
         return OKE;
     }
@@ -1157,7 +1161,9 @@ RetType ClipboardCaptureInitialize(void) {
      */
     void ShowRofiMenu(void) {
         xEntry1("ShowRofiMenu");
-        
+       
+        EnsureDB();
+
         /// 1. Create a temporary file to hold the menu items
         FILE *tmp = fopen(PATH_FILE_ROFI_MENU, "w");
         if (!tmp) {
